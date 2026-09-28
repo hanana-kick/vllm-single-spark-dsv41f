@@ -94,3 +94,31 @@ def test_field_view_validates_record_shape(tmp_path: Path):
     with pytest.raises(ValueError, match="record must be"):
         store.field_view(torch.empty(2, dtype=torch.uint8), "w13")
     store.close()
+
+def test_partial_field_writes_do_not_require_record_staging(tmp_path: Path):
+    path = tmp_path / "layer.experts"
+    store = DiskExpertStore.create_for_streaming(
+        path,
+        1,
+        [
+            ("w13", (8,), torch.uint8),
+            ("w2", (2,), torch.uint8),
+        ],
+        direct_io=False,
+    )
+    store.write_field(0, "w13", torch.tensor([1, 2, 3, 4], dtype=torch.uint8))
+    store.write_field(
+        0,
+        "w13",
+        torch.tensor([5, 6, 7, 8], dtype=torch.uint8),
+        byte_offset=4,
+    )
+    store.write_field(0, "w2", torch.tensor([9, 10], dtype=torch.uint8))
+    store.mark_expert_complete(0)
+    store.finalize()
+
+    dst = torch.empty(store.record_stride, dtype=torch.uint8)
+    store.read_record(0, dst)
+    assert store.field_view(dst, "w13").tolist() == list(range(1, 9))
+    assert store.field_view(dst, "w2").tolist() == [9, 10]
+    store.close()

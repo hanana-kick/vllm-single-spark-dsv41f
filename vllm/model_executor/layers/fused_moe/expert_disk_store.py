@@ -182,6 +182,57 @@ class DiskExpertStore:
         data = record[field.offset : field.offset + field.nbytes]
         return data.view(field.dtype).reshape(field.shape)
 
+    def write_field(
+        self,
+        expert_id: int,
+        field_name: str,
+        src: torch.Tensor,
+        *,
+        byte_offset: int = 0,
+    ) -> None:
+        """Write one field (or a byte range inside it) without staging a record.
+
+        Checkpoints are not required to emit w1/w2/w3 and their scales next to
+        each other. Writing each tensor directly into its final record range
+        keeps load-time RAM bounded by the checkpoint loader's current tensor
+        instead of the number of partially seen experts.
+        """
+        self._check_expert_id(expert_id)
+        if self.is_complete or self._wfd is None:
+            raise RuntimeError("expert store is not open for streaming writes")
+        if src.device.type != "cpu":
+            src = src.detach().cpu()
+        field = self.fields[field_name]
+        payload_tensor = src.contiguous().reshape(-1).view(torch.uint8)
+        nbytes = payload_tensor.numel()
+        if byte_offset < 0 or byte_offset + nbytes > field.nbytes:
+            raise ValueError(
+                f"field write outside {field_name}: offset={byte_offset} "
+                f"bytes={nbytes} field_bytes={field.nbytes}"
+            )
+        payload = memoryview(payload_tensor.numpy())
+        file_offset = (
+            expert_id * self.record_stride + field.offset + byte_offset
+        )
+        written = 0
+        while written < nbytes:
+            count = os.pwrite(
+                self._wfd, payload[written:], file_offset + written
+            )
+            if count <= 0:
+                raise OSError(
+                    f"short expert field write: expert={expert_id} "
+                    f"field={field_name} {written}/{nbytes}"
+                )
+            written += count
+
+    def mark_expert_complete(self, expert_id: int) -> None:
+        """Record that all required fields for an expert have been written."""
+        self._check_expert_id(expert_id)
+        if self.is_complete or self._wfd is None:
+            raise RuntimeError("expert store is not open for streaming writes")
+        self.mark_expert_complete(expert_id)
+
     def write_record(self, expert_id: int, record: torch.Tensor) -> None:
         """Write a completed expert during checkpoint streaming."""
         self._check_expert_id(expert_id)
