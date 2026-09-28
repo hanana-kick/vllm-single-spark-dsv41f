@@ -30,6 +30,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+        ExpertWeightProvider,
+    )
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
 
 
@@ -141,6 +144,11 @@ class RoutedExperts(PluggableLayer):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         # End random parameters
         self._loaded_expert_biases: set[str] = set()
+
+        # Optional runtime weight source. The default remains fully resident
+        # parameters; disk/CPU-backed implementations install a provider only
+        # after their fixed-address slot buffers and quant metadata are ready.
+        self.expert_weight_provider: "ExpertWeightProvider | None" = None
 
         self.quant_method = self._get_quant_method(
             self.layer_name,
