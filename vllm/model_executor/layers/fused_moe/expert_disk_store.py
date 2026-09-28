@@ -231,7 +231,11 @@ class DiskExpertStore:
         self._check_expert_id(expert_id)
         if self.is_complete or self._wfd is None:
             raise RuntimeError("expert store is not open for streaming writes")
-        self.mark_expert_complete(expert_id)
+        self._written.add(expert_id)
+        if len(self._written) % 16 == 0:
+            os.fdatasync(self._wfd)
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                os.posix_fadvise(self._wfd, 0, 0, os.POSIX_FADV_DONTNEED)
 
     def write_record(self, expert_id: int, record: torch.Tensor) -> None:
         """Write a completed expert during checkpoint streaming."""
