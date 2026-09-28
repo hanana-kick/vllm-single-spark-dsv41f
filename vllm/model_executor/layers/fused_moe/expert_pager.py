@@ -252,6 +252,13 @@ class LRUExpertSlotCache:
         with self._lock:
             return dict(self._mapping)
 
+    def reset(self) -> None:
+        """Forget all residency after a failed physical slot update."""
+        with self._lock:
+            self._mapping.clear()
+            self._lru.clear()
+            self._epoch += 1
+
     def plan(self, required: Iterable[ExpertPageKey]) -> ExpertSlotPlan:
         required_order = tuple(dict.fromkeys(required))
         if len(required_order) > self.capacity:
