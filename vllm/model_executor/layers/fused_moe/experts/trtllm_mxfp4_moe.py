@@ -317,12 +317,6 @@ class TrtLlmMxfp4ExpertsModular(TrtLlmMxfp4ExpertsBase, mk.FusedMoEExpertsModula
         # routing is done externally, so accept any routing method.
         return True
 
-    def supports_expert_map(self) -> bool:
-        # The routed kernel can consume slot-remapped IDs as long as routing
-        # happened before this expert-only stage. Paging providers use this to
-        # keep global router IDs while storing only a resident subset.
-        return True
-
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -442,25 +436,9 @@ class TrtLlmMxfp4ExpertsModular(TrtLlmMxfp4ExpertsBase, mk.FusedMoEExpertsModula
     ) -> UnfinalizedMoEOutput | None:
         topk_ids = topk_ids.to(dtype=torch.int32)
 
+        topk = topk_ids.size(-1)
         local_num_experts = w1.size(0)
         local_expert_offset = self.moe_config.ep_rank * local_num_experts
-        if expert_map is not None:
-            # Dynamic expert paging uses an EP-style global->physical slot map
-            # even on TP1. Routing has already produced the logical expert IDs,
-            # so remap only at the expert kernel boundary.
-            mapped = expert_map[topk_ids.to(dtype=torch.long)]
-            if torch.any(mapped < 0):
-                raise RuntimeError(
-                    "TRTLLM MXFP4 expert_map is missing a routed expert; "
-                    "the weight provider must admit the complete batch union "
-                    "before kernel execution"
-                )
-            topk_ids = mapped.to(dtype=torch.int32)
-            # IDs now address the compact physical slot array.
-            global_num_experts = local_num_experts
-            local_expert_offset = 0
-
-        topk = topk_ids.size(-1)
 
         if a1q_scale is not None:
             x_quant = hidden_states

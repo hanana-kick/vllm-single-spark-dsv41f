@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -19,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    B12X_BACKENDS,
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
@@ -574,7 +578,64 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        self.num_experts = num_experts
+        self.logical_num_experts = num_experts
+        self._nvme_paging_enabled = False
+        self._nvme_store = None
+        self._nvme_parts: dict[int, set[str]] = {}
+        self._nvme_completed_experts: set[int] = set()
+        self._nvme_store_dir = os.environ.get(
+            "VLLM_DSV41_NVME_EXPERT_STORE_DIR", ""
+        ).strip()
+
+        allocated_experts = num_experts
+        if self._nvme_store_dir:
+            cfg = get_current_vllm_config_or_none()
+            architecture = (
+                cfg.model_config.architecture
+                if cfg is not None and cfg.model_config is not None
+                else None
+            )
+            if architecture != "DeepseekV41ForCausalLM":
+                raise ValueError(
+                    "VLLM_DSV41_NVME_EXPERT_STORE_DIR is restricted to "
+                    f"DeepseekV41ForCausalLM, got {architecture!r}"
+                )
+            if self.moe.tp_size != 1 or self.moe.ep_size != 1:
+                raise ValueError(
+                    "DSV4.1 NVMe expert paging baseline requires TP=1 and EP=1"
+                )
+            if self.moe.has_bias:
+                raise ValueError(
+                    "DSV4.1 NVMe expert paging does not support expert biases"
+                )
+            if self.mxfp4_backend not in B12X_BACKENDS:
+                raise ValueError(
+                    "DGX Spark NVMe expert paging currently requires the "
+                    "B12X MXFP4 backend; start vLLM with --moe-backend b12x"
+                )
+            if self.experts_cls is None or self.experts_cls.__name__ != "B12xExperts":
+                raise ValueError(
+                    "DGX Spark NVMe expert paging requires B12xExperts, got "
+                    f"{self.experts_cls}"
+                )
+            slots_text = os.environ.get(
+                "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS", "64"
+            )
+            try:
+                slots = int(slots_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS must be an integer"
+                ) from exc
+            if not self.moe.experts_per_token <= slots <= num_experts:
+                raise ValueError(
+                    "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS must be between "
+                    f"top-k={self.moe.experts_per_token} and {num_experts}"
+                )
+            allocated_experts = slots
+            self._nvme_paging_enabled = True
+
+        self.num_experts = allocated_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         mxfp4_block = 32
@@ -586,10 +647,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.pop("weight_loader")
         scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
 
-        # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                allocated_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
@@ -602,7 +662,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                allocated_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
@@ -614,10 +674,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight_scale, {"weight_loader": scale_weight_loader})
         w13_weight_scale.quant_method = "block"
 
-        # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                allocated_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
@@ -630,7 +689,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                allocated_experts,
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
                 dtype=scale_dtype,
@@ -645,7 +704,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.moe.has_bias:
             w13_bias = torch.nn.Parameter(
                 torch.zeros(
-                    num_experts,
+                    allocated_experts,
                     self.moe.w13_num_shards * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
                 ),
@@ -657,7 +716,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             w2_bias = torch.nn.Parameter(
                 torch.zeros(
-                    num_experts,
+                    allocated_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
                 ),
@@ -666,6 +725,153 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
             set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
+
+        if self._nvme_paging_enabled:
+            layer._dsv41_nvme_paging = True
+            self._init_nvme_expert_store(layer)
+
+    def _init_nvme_expert_store(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.fused_moe.expert_disk_store import (
+            DiskExpertStore,
+        )
+
+        cfg = get_current_vllm_config_or_none()
+        assert cfg is not None and cfg.model_config is not None
+        safe_layer = layer.layer_name.replace("/", "_").replace(".", "_")
+        path = os.path.join(self._nvme_store_dir, safe_layer + ".experts")
+        direct_io = os.environ.get("VLLM_DSV41_NVME_DIRECT_IO", "1") != "0"
+        specs = [
+            (
+                "w13",
+                (
+                    self.moe.w13_num_shards * self.intermediate_size,
+                    self.hidden_size // 2,
+                ),
+                torch.uint8,
+            ),
+            (
+                "w2",
+                (self.hidden_size, self.intermediate_size // 2),
+                torch.uint8,
+            ),
+            (
+                "w13_scale",
+                (
+                    self.moe.w13_num_shards * self.intermediate_size,
+                    self.hidden_size // 32,
+                ),
+                torch.uint8,
+            ),
+            (
+                "w2_scale",
+                (self.hidden_size, self.intermediate_size // 32),
+                torch.uint8,
+            ),
+        ]
+        self._nvme_store = DiskExpertStore.create_for_streaming(
+            path,
+            self.logical_num_experts,
+            specs,
+            identity={
+                "layout": "deepseek-v41-raw-mxfp4-v1",
+                "model": str(cfg.model_config.model),
+                "revision": str(cfg.model_config.revision),
+                "layer": layer.layer_name,
+            },
+            direct_io=direct_io,
+        )
+
+    def stream_expert_weight(
+        self,
+        layer: RoutedExperts,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> bool:
+        if not self._nvme_paging_enabled:
+            return False
+        if "bias" in weight_name or "input_scale" in weight_name:
+            return False
+        if shard_id not in ("w1", "w2", "w3"):
+            return False
+
+        store = self._nvme_store
+        assert store is not None
+        if store.is_complete:
+            return True
+        if expert_id in self._nvme_completed_experts:
+            raise RuntimeError(
+                f"duplicate tensor arrived after expert {expert_id} was sealed"
+            )
+
+        is_scale = "scale" in weight_name
+        field_name = (
+            "w2_scale" if is_scale and shard_id == "w2" else
+            "w13_scale" if is_scale else
+            "w2" if shard_id == "w2" else
+            "w13"
+        )
+        field = store.fields[field_name]
+        src = loaded_weight.detach()
+        if src.device.type != "cpu":
+            src = src.cpu()
+        src = src.contiguous().reshape(-1).view(torch.uint8)
+
+        expected_nbytes = field.nbytes
+        byte_offset = 0
+        if shard_id in ("w1", "w3"):
+            expected_nbytes //= self.moe.w13_num_shards
+            if shard_id == "w3":
+                byte_offset = expected_nbytes
+        if src.numel() != expected_nbytes:
+            raise ValueError(
+                f"NVMe expert tensor size mismatch for {layer.layer_name} "
+                f"expert={expert_id} {shard_id} scale={is_scale}: "
+                f"checkpoint={src.numel()} store={expected_nbytes}"
+            )
+
+        store.write_field(
+            expert_id,
+            field_name,
+            src,
+            byte_offset=byte_offset,
+        )
+        part = f"{shard_id}:{'scale' if is_scale else 'weight'}"
+        parts = self._nvme_parts.setdefault(expert_id, set())
+        if part in parts:
+            raise RuntimeError(
+                f"duplicate expert component {part} for expert {expert_id}"
+            )
+        parts.add(part)
+        expected = {
+            "w1:weight", "w2:weight", "w3:weight",
+            "w1:scale", "w2:scale", "w3:scale",
+        }
+        if parts == expected:
+            store.mark_expert_complete(expert_id)
+            self._nvme_completed_experts.add(expert_id)
+            del self._nvme_parts[expert_id]
+        return True
+
+    def _load_seed_slots(self, layer: RoutedExperts) -> None:
+        store = self._nvme_store
+        assert store is not None and store.is_complete
+        row = torch.empty(store.record_stride, dtype=torch.uint8, pin_memory=True)
+        for slot in range(self.num_experts):
+            store.read_record(slot, row)
+            layer.w13_weight.data[slot].view(torch.uint8).copy_(
+                store.field_view(row, "w13"), non_blocking=False
+            )
+            layer.w2_weight.data[slot].view(torch.uint8).copy_(
+                store.field_view(row, "w2"), non_blocking=False
+            )
+            layer.w13_weight_scale.data[slot].view(torch.uint8).copy_(
+                store.field_view(row, "w13_scale"), non_blocking=False
+            )
+            layer.w2_weight_scale.data[slot].view(torch.uint8).copy_(
+                store.field_view(row, "w2_scale"), non_blocking=False
+            )
 
     def _setup_kernel(
         self,
@@ -785,6 +991,39 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
+        if self._nvme_paging_enabled:
+            store = self._nvme_store
+            assert store is not None
+            if self._nvme_parts:
+                raise RuntimeError(
+                    f"incomplete NVMe expert records remain: "
+                    f"{len(self._nvme_parts)} experts"
+                )
+            store.finalize()
+            self._load_seed_slots(layer)
+
+            self._setup_kernel(
+                layer,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            )
+
+            from vllm.model_executor.layers.fused_moe.b12x_disk_provider import (
+                B12xDiskExpertProvider,
+            )
+
+            experts = self.moe_kernel.fused_experts
+            layer.expert_weight_provider = B12xDiskExpertProvider(
+                layer=layer,
+                layer_id=int(layer.layer_name.split(".layers.", 1)[1].split(".", 1)[0]),
+                global_num_experts=self.logical_num_experts,
+                store=store,
+                b12x_experts=experts,
+            )
+            return
+
         if is_weights_pre_processed():
             if self.mxfp4_backend != Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8:
                 raise RuntimeError(
@@ -863,16 +1102,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = layer.expert_weight_provider
+        if provider is None:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+            expert_map = layer.expert_map
+        else:
+            prepared = provider.prepare(topk_ids)
+            w1 = prepared.w1
+            w2 = prepared.w2
+            expert_map = prepared.expert_map
+
         return self.moe_kernel.apply(
             hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
+            w1=w1,
+            w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=layer.expert_map,
+            expert_map=expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )

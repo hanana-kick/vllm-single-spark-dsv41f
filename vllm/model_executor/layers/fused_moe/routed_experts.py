@@ -657,6 +657,12 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        stream_loader = getattr(self.quant_method, "stream_expert_weight", None)
+        if stream_loader is not None and stream_loader(
+            self, loaded_weight, weight_name, shard_id, expert_id
+        ):
+            return True if return_success else None
+
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined

@@ -393,7 +393,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             params_dtype=self.moe_config.in_dtype,
         )
         prepared = self._reuse_prepared_storage(layer, prepared)
-        if prepared.plan.discards_source_parameters:
+        if (
+            prepared.plan.discards_source_parameters
+            and not getattr(layer, "_dsv41_nvme_paging", False)
+        ):
             self._release_source_parameters(layer)
         layer.b12x_warmup_provider = self
 
@@ -511,7 +514,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return True
 
     def supports_expert_map(self) -> bool:
-        return False
+        return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
@@ -739,7 +742,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         del w1, w2, global_num_experts
         del a1q_scale, a2_scale, workspace13, expert_tokens_meta
         if expert_map is not None:
-            raise ValueError("b12x TP MoE does not support expert maps")
+            mapped = expert_map[topk_ids.to(dtype=torch.long)]
+            if torch.any(mapped < 0):
+                raise RuntimeError(
+                    "B12X expert_map is missing a routed expert; the paging "
+                    "provider must admit the complete batch union first"
+                )
+            topk_ids = mapped
         if bool(apply_router_weight_on_input) != self._apply_router_weight_on_input:
             raise ValueError(
                 "apply_router_weight_on_input does not match the prepared b12x MoE plan"
