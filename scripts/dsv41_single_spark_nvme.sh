@@ -19,6 +19,9 @@ export VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS="${EXPERT_CACHE_SLOTS}"
 # Buffered reads first. Enable O_DIRECT only after correctness is established.
 export VLLM_DSV41_NVME_DIRECT_IO="${VLLM_DSV41_NVME_DIRECT_IO:-0}"
 export VLLM_DSV41_NVME_EXPERT_READ_BATCH="${VLLM_DSV41_NVME_EXPERT_READ_BATCH:-8}"
+# GB10 UMA: let NVMe reads write the pinned backing that FlashInfer reads
+# through a CUDA UVA view. Set to 0 for the conventional staged-CUDA path.
+export VLLM_DSV41_NVME_UVA_SLOTS="${VLLM_DSV41_NVME_UVA_SLOTS:-1}"
 
 export VLLM_DSV41_ENGRAM_DISK=1
 export VLLM_DSV41_ENGRAM_DISK_DIR="${MODEL_DIR}"

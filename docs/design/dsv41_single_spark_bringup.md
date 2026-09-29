@@ -92,3 +92,31 @@ If a prefill batch routes to more unique experts in one layer than the
 configured slot count, the current correctness provider fails explicitly.
 Lower `MAX_BATCHED_TOKENS` or raise `EXPERT_CACHE_SLOTS`; do not interpret
 that failure as a model-quality issue.
+
+
+## GB10 UVA slots
+
+The performance profile enables `VLLM_DSV41_NVME_UVA_SLOTS=1` by default.
+Expert slot tensors are backed by pinned CPU memory and exposed to CUDA using
+vLLM's existing UVA device-view helper. On GB10 this is the same coherent
+LPDDR5X pool.
+
+For a cache miss, buffered `preadv` writes the four expert fields directly
+into the actual slot backing:
+
+```
+NVMe -> pinned UMA expert slot -> CUDA UVA view -> FlashInfer CUTLASS
+```
+
+There is no staging-to-device copy in this mode. Slot overwrites are protected
+by a CUDA event recorded after the previous MoE launch. Cache-hit-only decode
+does not wait on that event.
+
+A/B fallback:
+
+```bash
+VLLM_DSV41_NVME_UVA_SLOTS=0 bash scripts/dsv41_single_spark_nvme.sh
+```
+
+The fallback keeps CUDA-resident slots and uses aligned pinned staging plus
+batched async H2D.

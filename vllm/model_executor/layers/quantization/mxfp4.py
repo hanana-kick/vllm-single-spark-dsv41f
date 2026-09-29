@@ -46,6 +46,8 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import is_uva_available
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
 
@@ -646,6 +648,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._nvme_paging_enabled = True
 
         self.num_experts = allocated_experts
+        self._nvme_uva_slots = (
+            self._nvme_paging_enabled
+            and os.environ.get("VLLM_DSV41_NVME_UVA_SLOTS", "1") != "0"
+        )
+        if self._nvme_uva_slots and not is_uva_available():
+            raise RuntimeError(
+                "VLLM_DSV41_NVME_UVA_SLOTS=1 requires CUDA UVA host mapping"
+            )
+        slot_backing: dict[str, torch.Tensor] = {}
+
+        def make_slot_parameter(
+            name: str,
+            shape: tuple[int, ...],
+            dtype: torch.dtype,
+        ) -> torch.nn.Parameter:
+            if not self._nvme_uva_slots:
+                return torch.nn.Parameter(
+                    torch.zeros(*shape, dtype=dtype),
+                    requires_grad=False,
+                )
+            backing = torch.zeros(
+                *shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            view = get_accelerator_view_from_cpu_tensor(backing)
+            slot_backing[name] = backing
+            return torch.nn.Parameter(view, requires_grad=False)
+
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         mxfp4_block = 32
@@ -657,54 +689,54 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.pop("weight_loader")
         scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
 
-        w13_weight = torch.nn.Parameter(
-            torch.zeros(
+        w13_weight = make_slot_parameter(
+            "w13",
+            (
                 allocated_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // 2,
-                dtype=weight_dtype,
             ),
-            requires_grad=False,
+            weight_dtype,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
 
-        w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+        w13_weight_scale = make_slot_parameter(
+            "w13_scale",
+            (
                 allocated_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
-                dtype=scale_dtype,
             ),
-            requires_grad=False,
+            scale_dtype,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w13_weight_scale, {"weight_loader": scale_weight_loader})
         w13_weight_scale.quant_method = "block"
 
-        w2_weight = torch.nn.Parameter(
-            torch.zeros(
+        w2_weight = make_slot_parameter(
+            "w2",
+            (
                 allocated_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
-                dtype=weight_dtype,
             ),
-            requires_grad=False,
+            weight_dtype,
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
-        w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+        w2_weight_scale = make_slot_parameter(
+            "w2_scale",
+            (
                 allocated_experts,
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
-                dtype=scale_dtype,
             ),
-            requires_grad=False,
+            scale_dtype,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
@@ -738,6 +770,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self._nvme_paging_enabled:
             layer._dsv41_nvme_paging = True
+            if self._nvme_uva_slots:
+                layer._dsv41_nvme_cpu_backing = slot_backing
             self._init_nvme_expert_store(layer)
 
     def _init_nvme_expert_store(self, layer: RoutedExperts) -> None:
@@ -1090,6 +1124,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2=layer.w2_weight,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                cpu_backing=getattr(
+                    layer, "_dsv41_nvme_cpu_backing", None
+                ),
                 read_batch=read_batch,
             )
             return
@@ -1192,7 +1229,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         groups = provider.partition(topk_ids)
         if len(groups) == 1:
             prepared = provider.prepare_keys(groups[0])
-            return self.moe_kernel.apply(
+            output = self.moe_kernel.apply(
                 hidden_states=x,
                 w1=prepared.w1,
                 w2=prepared.w2,
@@ -1205,6 +1242,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+            provider.mark_compute_submitted()
+            return output
 
         # Wide prefill can touch more unique experts than the resident cache.
         # Execute exact partial sums in cache-sized expert groups instead of
@@ -1240,6 +1279,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     shared_experts_input if group_index == 0 else None
                 ),
             )
+            provider.mark_compute_submitted()
             if isinstance(partial, UnfinalizedMoEOutput):
                 raise RuntimeError(
                     "partitioned NVMe prefill does not support deferred MoE finalize"

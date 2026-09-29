@@ -39,7 +39,8 @@ class FlashInferMxfp4DiskExpertProvider:
         w2: torch.Tensor,
         w13_scale: torch.Tensor,
         w2_scale: torch.Tensor,
-        read_batch: int = 6,
+        cpu_backing: dict[str, torch.Tensor] | None = None,
+        read_batch: int = 8,
     ) -> None:
         capacity = int(w13.shape[0])
         if not (
@@ -64,6 +65,25 @@ class FlashInferMxfp4DiskExpertProvider:
         self.w2 = w2
         self.w13_scale = w13_scale
         self.w2_scale = w2_scale
+        self.cpu_backing = cpu_backing
+        self.uses_uva = cpu_backing is not None
+        if self.uses_uva:
+            assert cpu_backing is not None
+            required = {"w13", "w2", "w13_scale", "w2_scale"}
+            if set(cpu_backing) != required:
+                raise ValueError(
+                    f"UVA slot backing must contain {sorted(required)}"
+                )
+            for name, tensor in cpu_backing.items():
+                if tensor.device.type != "cpu" or not tensor.is_pinned():
+                    raise ValueError(
+                        f"UVA backing {name} must be pinned CPU memory"
+                    )
+                if int(tensor.shape[0]) != capacity:
+                    raise ValueError(
+                        f"UVA backing {name} has wrong slot count "
+                        f"{tensor.shape[0]} != {capacity}"
+                    )
         self.cache = LRUExpertSlotCache(capacity)
         self.expert_map = torch.full(
             (global_num_experts,),
@@ -72,23 +92,25 @@ class FlashInferMxfp4DiskExpertProvider:
             device=w13.device,
         )
         self.read_batch = max(1, int(read_batch))
-        # O_DIRECT needs page-aligned userspace buffers. Torch pinned
-        # allocations are DMA-friendly but not guaranteed to be 4 KiB aligned,
-        # so over-allocate and retain aligned views plus their owners.
         self._staging_owners: list[torch.Tensor] = []
         self._staging: list[torch.Tensor] = []
-        for _ in range(self.read_batch):
-            owner = torch.empty(
-                store.record_stride + 4096,
-                dtype=torch.uint8,
-                pin_memory=True,
-            )
-            shift = (-owner.data_ptr()) % 4096
-            view = owner[shift : shift + store.record_stride]
-            assert view.data_ptr() % 4096 == 0
-            self._staging_owners.append(owner)
-            self._staging.append(view)
+        if not self.uses_uva:
+            # O_DIRECT needs page-aligned userspace buffers. Torch pinned
+            # allocations are DMA-friendly but not guaranteed to be 4 KiB
+            # aligned, so over-allocate and retain aligned views.
+            for _ in range(self.read_batch):
+                owner = torch.empty(
+                    store.record_stride + 4096,
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+                shift = (-owner.data_ptr()) % 4096
+                view = owner[shift : shift + store.record_stride]
+                assert view.data_ptr() % 4096 == 0
+                self._staging_owners.append(owner)
+                self._staging.append(view)
         self._copy_done: torch.cuda.Event | None = None
+        self._compute_done: torch.cuda.Event | None = None
         self._pool = ThreadPoolExecutor(
             max_workers=self.read_batch,
             thread_name_prefix="vllm-expert-nvme",
@@ -175,6 +197,44 @@ class FlashInferMxfp4DiskExpertProvider:
             self.store.field_view(record, "w2_scale"), non_blocking=True
         )
 
+    def _wait_compute_before_uva_write(self) -> None:
+        if self.uses_uva and self._compute_done is not None:
+            # CPU preadv is not ordered by a CUDA stream. Never overwrite a
+            # mapped slot until the previous kernel using it has completed.
+            self._compute_done.synchronize()
+            self._compute_done = None
+
+    def mark_compute_submitted(self) -> None:
+        """Fence slot reuse after a kernel that consumed the current mapping."""
+        if not self.uses_uva:
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        self._compute_done = event
+
+    def _load_records_uva(self, loads) -> None:
+        assert self.cpu_backing is not None
+        self._wait_compute_before_uva_write()
+
+        def read_one(load) -> int:
+            slot = load.slot
+            return self.store.read_fields(
+                load.key.expert_id,
+                {
+                    "w13": self.cpu_backing["w13"][slot],
+                    "w2": self.cpu_backing["w2"][slot],
+                    "w13_scale": self.cpu_backing["w13_scale"][slot],
+                    "w2_scale": self.cpu_backing["w2_scale"][slot],
+                },
+            )
+
+        for start in range(0, len(loads), self.read_batch):
+            batch = loads[start : start + self.read_batch]
+            futures = [self._pool.submit(read_one, load) for load in batch]
+            for future in futures:
+                future.result()
+            self.disk_reads += len(batch)
+
     def _wait_staging_reuse(self) -> None:
         if self._copy_done is not None:
             # Only wait when the host is about to overwrite the same pinned
@@ -184,10 +244,16 @@ class FlashInferMxfp4DiskExpertProvider:
             self._copy_done = None
 
     def _load_records(self, loads) -> None:
-        """Parallel NVMe reads + batched async H2D into resident slots."""
+        """Parallel NVMe reads into UVA slots or staged CUDA slots."""
+        if not loads:
+            return
         # Record-sized reads are large; stable expert-id order improves
         # locality/readahead for buffered I/O without changing slot placement.
         loads = sorted(loads, key=lambda load: load.key.expert_id)
+        if self.uses_uva:
+            self._load_records_uva(loads)
+            return
+
         for start in range(0, len(loads), self.read_batch):
             self._wait_staging_reuse()
             batch = loads[start : start + self.read_batch]
@@ -257,6 +323,7 @@ class FlashInferMxfp4DiskExpertProvider:
 
     def close(self) -> None:
         self._wait_staging_reuse()
+        self._wait_compute_before_uva_write()
         self._pool.shutdown(wait=True)
 
     def __del__(self) -> None:

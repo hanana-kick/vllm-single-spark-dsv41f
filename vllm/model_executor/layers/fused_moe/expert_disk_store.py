@@ -20,6 +20,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
 from typing import TextIO
 
 import torch
@@ -75,6 +76,7 @@ class DiskExpertStore:
         self.direct_io = direct_io
         self.is_complete = False
         self._fd: int | None = None
+        self._buffered_fd: int | None = None
         self._open_lock = threading.Lock()
         self._using_direct_io = False
         self._wfd: int | None = None
@@ -320,6 +322,81 @@ class DiskExpertStore:
             got += nbytes
         return got
 
+    def read_fields(
+        self,
+        expert_id: int,
+        destinations: Mapping[str, torch.Tensor],
+    ) -> int:
+        """Read record fields directly into CPU tensors using buffered preadv.
+
+        This is used by GB10 UVA expert slots: the CPU tensors are the backing
+        storage of the CUDA-visible weights, so no staging or H2D copy is
+        needed. Buffered I/O is intentional because individual field iovecs
+        are not guaranteed to satisfy O_DIRECT alignment constraints.
+        """
+        self._check_expert_id(expert_id)
+        if not self.is_complete:
+            raise RuntimeError("cannot read an incomplete expert store")
+        if set(destinations) != set(self.fields):
+            raise ValueError(
+                "destinations must contain exactly the expert-store fields"
+            )
+
+        views: list[memoryview] = []
+        total = 0
+        for field in self.fields.values():
+            dst = destinations[field.name]
+            if dst.device.type != "cpu" or not dst.is_contiguous():
+                raise ValueError(
+                    f"{field.name} destination must be contiguous CPU memory"
+                )
+            raw = dst.reshape(-1).view(torch.uint8)
+            if raw.numel() != field.nbytes:
+                raise ValueError(
+                    f"{field.name} destination has {raw.numel()} bytes, "
+                    f"expected {field.nbytes}"
+                )
+            view = memoryview(raw.numpy()).cast("B")
+            views.append(view)
+            total += len(view)
+
+        fd = self._open_buffered_reader()
+        file_offset = expert_id * self.record_stride
+        pending = views
+        read_total = 0
+        while pending:
+            count = os.preadv(fd, pending, file_offset + read_total)
+            if count <= 0:
+                raise OSError(
+                    f"short expert field read: expert={expert_id} "
+                    f"{read_total}/{total}"
+                )
+            read_total += count
+
+            consumed = count
+            next_pending: list[memoryview] = []
+            for view in pending:
+                if consumed >= len(view):
+                    consumed -= len(view)
+                    continue
+                if consumed:
+                    view = view[consumed:]
+                    consumed = 0
+                next_pending.append(view)
+            pending = next_pending
+
+        if read_total != total:
+            raise OSError(
+                f"expert field read size mismatch: {read_total}/{total}"
+            )
+        return read_total
+
+    def _open_buffered_reader(self) -> int:
+        with self._open_lock:
+            if self._buffered_fd is None:
+                self._buffered_fd = os.open(self.path, os.O_RDONLY)
+            return self._buffered_fd
+
     def read_record(self, expert_id: int, dst: torch.Tensor) -> int:
         """Read one complete record, preferring O_DIRECT when requested."""
         self._check_expert_id(expert_id)
@@ -396,6 +473,9 @@ class DiskExpertStore:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+        if self._buffered_fd is not None:
+            os.close(self._buffered_fd)
+            self._buffered_fd = None
         if self._wfd is not None:
             os.close(self._wfd)
             self._wfd = None
