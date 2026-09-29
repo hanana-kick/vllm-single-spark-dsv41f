@@ -628,7 +628,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if slots_text is None:
                 raise ValueError(
                     "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS must be set explicitly "
-                    "when NVMe paging is enabled. Start with 24 on a 128 GB "
+                    "when NVMe paging is enabled. Start with 64 on a 128 GB "
                     "DGX Spark correctness run."
                 )
             try:

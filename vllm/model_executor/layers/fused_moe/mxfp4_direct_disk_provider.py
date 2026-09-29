@@ -72,10 +72,23 @@ class FlashInferMxfp4DiskExpertProvider:
             device=w13.device,
         )
         self.read_batch = max(1, int(read_batch))
-        self._staging = [
-            torch.empty(store.record_stride, dtype=torch.uint8, pin_memory=True)
-            for _ in range(self.read_batch)
-        ]
+        # O_DIRECT needs page-aligned userspace buffers. Torch pinned
+        # allocations are DMA-friendly but not guaranteed to be 4 KiB aligned,
+        # so over-allocate and retain aligned views plus their owners.
+        self._staging_owners: list[torch.Tensor] = []
+        self._staging: list[torch.Tensor] = []
+        for _ in range(self.read_batch):
+            owner = torch.empty(
+                store.record_stride + 4096,
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+            shift = (-owner.data_ptr()) % 4096
+            view = owner[shift : shift + store.record_stride]
+            assert view.data_ptr() % 4096 == 0
+            self._staging_owners.append(owner)
+            self._staging.append(view)
+        self._copy_done: torch.cuda.Event | None = None
         self._pool = ThreadPoolExecutor(
             max_workers=self.read_batch,
             thread_name_prefix="vllm-expert-nvme",
@@ -144,21 +157,30 @@ class FlashInferMxfp4DiskExpertProvider:
         self, record: torch.Tensor, slot: int
     ) -> None:
         self.w13[slot].view(torch.uint8).copy_(
-            self.store.field_view(record, "w13"), non_blocking=False
+            self.store.field_view(record, "w13"), non_blocking=True
         )
         self.w2[slot].view(torch.uint8).copy_(
-            self.store.field_view(record, "w2"), non_blocking=False
+            self.store.field_view(record, "w2"), non_blocking=True
         )
         self.w13_scale[slot].view(torch.uint8).copy_(
-            self.store.field_view(record, "w13_scale"), non_blocking=False
+            self.store.field_view(record, "w13_scale"), non_blocking=True
         )
         self.w2_scale[slot].view(torch.uint8).copy_(
-            self.store.field_view(record, "w2_scale"), non_blocking=False
+            self.store.field_view(record, "w2_scale"), non_blocking=True
         )
 
+    def _wait_staging_reuse(self) -> None:
+        if self._copy_done is not None:
+            # Only wait when the host is about to overwrite the same pinned
+            # buffers. MoE compute itself stays ordered behind the async H2D on
+            # the current CUDA stream without a host-side synchronization.
+            self._copy_done.synchronize()
+            self._copy_done = None
+
     def _load_records(self, loads) -> None:
-        """Issue positional NVMe reads in parallel, then copy into GPU slots."""
+        """Parallel NVMe reads + batched async H2D into resident slots."""
         for start in range(0, len(loads), self.read_batch):
+            self._wait_staging_reuse()
             batch = loads[start : start + self.read_batch]
             futures = [
                 self._pool.submit(
@@ -170,13 +192,15 @@ class FlashInferMxfp4DiskExpertProvider:
             ]
             for future in futures:
                 future.result()
+
             for i, load in enumerate(batch):
                 self._copy_record_to_slot(self._staging[i], load.slot)
-            self.disk_reads += len(batch)
 
-        # Baseline uses blocking H2D so a staging buffer is never overwritten
-        # while its previous DMA is still in flight. Double-buffered async H2D
-        # is a later optimization.
+            # All copies above are queued on the current stream. Record a fence
+            # used only before these pinned buffers are recycled.
+            self._copy_done = torch.cuda.Event()
+            self._copy_done.record(torch.cuda.current_stream())
+            self.disk_reads += len(batch)
 
     def prepare_keys(
         self, required: tuple[ExpertPageKey, ...]
@@ -223,6 +247,7 @@ class FlashInferMxfp4DiskExpertProvider:
         return self.prepare_keys(required)
 
     def close(self) -> None:
+        self._wait_staging_reuse()
         self._pool.shutdown(wait=True)
 
     def __del__(self) -> None:
