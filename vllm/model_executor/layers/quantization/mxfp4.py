@@ -619,8 +619,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     f"{self.experts_cls}"
                 )
             slots_text = os.environ.get(
-                "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS", "64"
+                "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS"
             )
+            if slots_text is None:
+                raise ValueError(
+                    "VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS must be set explicitly "
+                    "when NVMe paging is enabled. Start with 24 on a 128 GB "
+                    "DGX Spark correctness run."
+                )
             try:
                 slots = int(slots_text)
             except ValueError as exc:
