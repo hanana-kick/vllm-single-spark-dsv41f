@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.expert_disk_store import DiskExpertStore
 from vllm.model_executor.layers.fused_moe.expert_pager import (
     ExpertPageKey,
@@ -18,6 +21,8 @@ from vllm.model_executor.layers.fused_moe.expert_pager import (
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     ExpertWeightResult,
 )
+
+logger = init_logger(__name__)
 
 
 class FlashInferMxfp4DiskExpertProvider:
@@ -119,6 +124,14 @@ class FlashInferMxfp4DiskExpertProvider:
         self.disk_reads = 0
         self.cache_hits = 0
         self.cache_misses = 0
+        self.read_seconds = 0.0
+        self.prepare_calls = 0
+        self.stats_every = int(
+            os.environ.get("VLLM_DSV41_NVME_STATS_EVERY", "0")
+        )
+        self.record_payload_bytes = sum(
+            field.nbytes for field in store.fields.values()
+        )
 
     @property
     def capacity(self) -> int:
@@ -230,9 +243,11 @@ class FlashInferMxfp4DiskExpertProvider:
 
         for start in range(0, len(loads), self.read_batch):
             batch = loads[start : start + self.read_batch]
+            started = time.perf_counter()
             futures = [self._pool.submit(read_one, load) for load in batch]
             for future in futures:
                 future.result()
+            self.read_seconds += time.perf_counter() - started
             self.disk_reads += len(batch)
 
     def _wait_staging_reuse(self) -> None:
@@ -257,6 +272,7 @@ class FlashInferMxfp4DiskExpertProvider:
         for start in range(0, len(loads), self.read_batch):
             self._wait_staging_reuse()
             batch = loads[start : start + self.read_batch]
+            started = time.perf_counter()
             futures = [
                 self._pool.submit(
                     self.store.read_record,
@@ -267,6 +283,7 @@ class FlashInferMxfp4DiskExpertProvider:
             ]
             for future in futures:
                 future.result()
+            self.read_seconds += time.perf_counter() - started
 
             for i, load in enumerate(batch):
                 self._copy_record_to_slot(self._staging[i], load.slot)
@@ -276,6 +293,35 @@ class FlashInferMxfp4DiskExpertProvider:
             self._copy_done = torch.cuda.Event()
             self._copy_done.record(torch.cuda.current_stream())
             self.disk_reads += len(batch)
+
+    def _maybe_log_stats(self) -> None:
+        self.prepare_calls += 1
+        if self.stats_every <= 0 or self.prepare_calls % self.stats_every:
+            return
+        total = self.cache_hits + self.cache_misses
+        hit_rate = 100.0 * self.cache_hits / total if total else 0.0
+        read_gib = (
+            self.disk_reads * self.record_payload_bytes / float(1 << 30)
+        )
+        read_gbps = (
+            self.disk_reads * self.record_payload_bytes
+            / self.read_seconds
+            / 1e9
+            if self.read_seconds > 0
+            else 0.0
+        )
+        logger.info(
+            "DSV4.1 NVMe layer=%d calls=%d hit=%.1f%% "
+            "reads=%d (%.2f GiB) read=%.2f GB/s slots=%d UVA=%s",
+            self.layer_id,
+            self.prepare_calls,
+            hit_rate,
+            self.disk_reads,
+            read_gib,
+            read_gbps,
+            self.capacity,
+            self.uses_uva,
+        )
 
     def prepare_keys(
         self, required: tuple[ExpertPageKey, ...]
@@ -306,6 +352,7 @@ class FlashInferMxfp4DiskExpertProvider:
             for key, slot in self.cache.snapshot().items():
                 self.expert_map[key.expert_id] = slot
 
+            self._maybe_log_stats()
             return ExpertWeightResult(
                 w1=self.w13,
                 w2=self.w2,

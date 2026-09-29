@@ -82,7 +82,7 @@ SERVED_MODEL_NAME=big
 PORT=8000
 CTX=8192
 MAX_SEQS=1
-MAX_BATCHED_TOKENS=2048
+MAX_BATCHED_TOKENS=8192
 EXPERT_CACHE_SLOTS=64
 ENGRAM_THREADS=32
 GPU_MEMORY_UTILIZATION=0.70
@@ -120,3 +120,21 @@ VLLM_DSV41_NVME_UVA_SLOTS=0 bash scripts/dsv41_single_spark_nvme.sh
 
 The fallback keeps CUDA-resident slots and uses aligned pinned staging plus
 batched async H2D.
+
+
+## Pager performance counters
+
+Set:
+
+```bash
+export VLLM_DSV41_NVME_STATS_EVERY=128
+```
+
+to emit per-layer cumulative statistics every 128 pager calls:
+
+```text
+DSV4.1 NVMe layer=... hit=...% reads=... (... GiB) read=... GB/s slots=... UVA=...
+```
+
+This separates three important causes of slow decode: insufficient resident
+hit rate, low effective NVMe throughput, and compute outside the pager.
