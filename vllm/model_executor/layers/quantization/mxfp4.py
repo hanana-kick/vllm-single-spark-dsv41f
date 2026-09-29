@@ -1069,9 +1069,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     f"{len(self._nvme_parts)} experts"
                 )
             store.finalize()
-            self._load_seed_slots(layer)
 
-            # Disk records and seed slots are already in FlashInfer CUTLASS
+            # Disk records are already in FlashInfer CUTLASS
             # runtime layout, so do not call _setup_kernel (it would convert
             # them a second time).
             self._build_moe_kernel(layer)

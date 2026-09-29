@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -106,14 +107,38 @@ class FlashInferMxfp4DiskExpertProvider:
     def partition(
         self, topk_ids: torch.Tensor
     ) -> tuple[tuple[ExpertPageKey, ...], ...]:
-        """Partition one prefill's expert union into cache-sized passes."""
-        required = self._required(topk_ids)
-        if not required:
+        """Partition a wide prefill while leaving its hottest experts resident.
+
+        Cold/rare experts run first. The final pass is exactly one cache worth
+        of the most frequently routed experts (when the union exceeds
+        capacity), so decode starts with a prompt-specific hot set instead of
+        whichever expert IDs happened to occur last in token order.
+        """
+        flat = [
+            int(value)
+            for value in topk_ids.detach().reshape(-1).to("cpu").tolist()
+            if int(value) >= 0
+        ]
+        if not flat:
             return ((),)
-        return tuple(
-            tuple(required[i : i + self.capacity])
-            for i in range(0, len(required), self.capacity)
+
+        counts = Counter(flat)
+        ordered_ids = sorted(counts, key=lambda expert: (counts[expert], expert))
+        required = tuple(
+            ExpertPageKey(self.layer_id, expert_id) for expert_id in ordered_ids
         )
+        if len(required) <= self.capacity:
+            return (required,)
+
+        hot_start = len(required) - self.capacity
+        cold = required[:hot_start]
+        hot = required[hot_start:]
+        groups = [
+            tuple(cold[i : i + self.capacity])
+            for i in range(0, len(cold), self.capacity)
+        ]
+        groups.append(tuple(hot))
+        return tuple(groups)
 
     def _copy_record_to_slot(
         self, record: torch.Tensor, slot: int
