@@ -278,11 +278,23 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        disk_model_dir: str | None = None,
+        disk_layer_id: int | None = None,
     ) -> None:
-        self.cpu_offload = cpu_offload
+        self.disk_mode = os.environ.get("VLLM_DSV41_ENGRAM_DISK", "0") == "1"
+        if self.disk_mode and dp_shared_memory:
+            raise ValueError("disk-backed Engram does not support dp_shared_memory")
+        if self.disk_mode and get_tensor_model_parallel_world_size() != 1:
+            raise ValueError("disk-backed Engram baseline currently requires TP=1")
+        self.cpu_offload = cpu_offload and not self.disk_mode
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
         self._packed: torch.Tensor | None = None
+        self._disk = None
+        if self.disk_mode:
+            # Base __init__ attaches this loader to the tiny placeholder
+            # Parameters; it intentionally does not copy the 200 GB tables.
+            self._weight_loader = self._disk_weight_loader
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -300,7 +312,33 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         super().__init__(num_embeddings, dim, head_sizes, block_size)
-        if cpu_offload:
+        if self.disk_mode:
+            if disk_model_dir is None or disk_layer_id is None:
+                raise ValueError(
+                    "disk-backed Engram requires VLLM_DSV41_ENGRAM_DISK_DIR "
+                    "and a checkpoint layer id"
+                )
+            from vllm.models.deepseek_v41.nvidia.engram_disk import DiskEngramTable
+
+            threads = int(os.environ.get("VLLM_DSV41_ENGRAM_DISK_THREADS", "32"))
+            self._disk = DiskEngramTable(
+                disk_model_dir,
+                layer_id=disk_layer_id,
+                dim=dim,
+                block_size=block_size,
+                row_start=self.vocab_start_idx,
+                num_rows=self.part_num_embeddings,
+                threads=threads,
+            )
+            logger.info(
+                "Engram table disk-backed: layer=%d rows=[%d,%d) %.2f GiB "
+                "not allocated in unified memory",
+                disk_layer_id,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+            )
+        if self.cpu_offload:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
@@ -314,12 +352,29 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                 "shared across DP replicas" if dp_shared_memory else "per rank",
             )
 
+    @staticmethod
+    def _disk_weight_loader(
+        param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        # The checkpoint iterator may still expose this mmap-backed tensor, but
+        # the payload is intentionally not copied into unified memory.
+        del param, loaded_weight
+
     def _get_shard_info(self) -> tuple[int, int]:
         if self.dp_size == 1:
             return super()._get_shard_info()
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.disk_mode:
+            # Preserve parameter names for AutoWeightsLoader without allocating
+            # the rank-local table. lookup() never reads these placeholders.
+            return (
+                torch.zeros(1, self.dim, dtype=torch.float8_e4m3fn, device="cpu"),
+                torch.zeros(
+                    1, self.dim // self.block_size, dtype=torch.uint8, device="cpu"
+                ),
+            )
         if self.dp_shared_memory:
             group = get_engram_dp_group()
             assert group is not None
@@ -374,6 +429,8 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             )
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.disk_mode:
+            raise RuntimeError("disk-backed Engram has no resident table storage")
         if self._shared_memory is not None:
             return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
         if not self.cpu_offload:
@@ -387,6 +444,40 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             self._view_src = src
         assert self._views is not None
         return self._views
+
+    def lookup(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> None:
+        if not self.disk_mode:
+            return super().lookup(indices, out, background=background)
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "disk-backed Engram performs host I/O and requires eager "
+                "execution for the correctness baseline"
+            )
+        assert self._disk is not None
+        num_tokens = indices.shape[0]
+        local_heads = self.part_n_hash_cols
+        head_end = min(self.head_start + local_heads, self.n_hash_cols)
+        ids = indices[:, self.head_start:head_end].detach().to(
+            device="cpu", dtype=torch.int64
+        )
+        if ids.shape[1] < local_heads:
+            pad = torch.full(
+                (num_tokens, local_heads - ids.shape[1]),
+                -1,
+                dtype=torch.int64,
+            )
+            ids = torch.cat((ids, pad), dim=1)
+        flat = ids.reshape(-1)
+        owned = (flat >= self.vocab_start_idx) & (flat < self.vocab_end_idx)
+        local = torch.where(
+            owned, flat - self.vocab_start_idx, torch.zeros_like(flat)
+        )
+        rows = self._disk.read_rows(local, owned).reshape(
+            num_tokens, local_heads, self.dim
+        )
+        out.copy_(rows.to(device=out.device), non_blocking=False)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.dp_size == 1:
@@ -443,6 +534,13 @@ class Engram(BaseEngram):
     ) -> ParallelEngramEmbedding:
         engram_config = get_current_vllm_config().engram_config
         assert engram_config is not None
+        disk_enabled = os.environ.get("VLLM_DSV41_ENGRAM_DISK", "0") == "1"
+        disk_dir = os.environ.get("VLLM_DSV41_ENGRAM_DISK_DIR")
+        if disk_enabled and not disk_dir:
+            raise ValueError(
+                "VLLM_DSV41_ENGRAM_DISK=1 requires "
+                "VLLM_DSV41_ENGRAM_DISK_DIR=/path/to/model/snapshot"
+            )
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
@@ -450,6 +548,8 @@ class Engram(BaseEngram):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            disk_model_dir=disk_dir,
+            disk_layer_id=layout.layer_ids[layer_hash_index],
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
