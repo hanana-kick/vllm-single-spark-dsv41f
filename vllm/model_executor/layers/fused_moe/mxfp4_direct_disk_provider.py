@@ -122,11 +122,17 @@ class FlashInferMxfp4DiskExpertProvider:
     ) -> tuple[tuple[ExpertPageKey, ...], ...]:
         """Partition a wide prefill while leaving its hottest experts resident.
 
+        Decode and small batches take the cheaper ordered-dedup path. Only a
+        batch that could exceed resident capacity pays for frequency counting.
+
         Cold/rare experts run first. The final pass is exactly one cache worth
         of the most frequently routed experts (when the union exceeds
         capacity), so decode starts with a prompt-specific hot set instead of
         whichever expert IDs happened to occur last in token order.
         """
+        if topk_ids.numel() <= self.capacity:
+            return (self._required(topk_ids),)
+
         flat = [
             int(value)
             for value in topk_ids.detach().reshape(-1).to("cpu").tolist()
@@ -179,6 +185,9 @@ class FlashInferMxfp4DiskExpertProvider:
 
     def _load_records(self, loads) -> None:
         """Parallel NVMe reads + batched async H2D into resident slots."""
+        # Record-sized reads are large; stable expert-id order improves
+        # locality/readahead for buffered I/O without changing slot placement.
+        loads = sorted(loads, key=lambda load: load.key.expert_id)
         for start in range(0, len(loads), self.read_batch):
             self._wait_staging_reuse()
             batch = loads[start : start + self.read_batch]
