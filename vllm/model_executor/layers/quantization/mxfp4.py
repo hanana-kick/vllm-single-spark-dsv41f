@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from dataclasses import replace
 
 import torch
 
@@ -22,7 +23,6 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-    B12X_BACKENDS,
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
@@ -608,14 +608,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 raise ValueError(
                     "DSV4.1 NVMe expert paging does not support expert biases"
                 )
-            if self.mxfp4_backend not in B12X_BACKENDS:
+            if (
+                self.mxfp4_backend
+                != Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8
+            ):
                 raise ValueError(
-                    "DGX Spark NVMe expert paging currently requires the "
-                    "B12X MXFP4 backend; start vLLM with --moe-backend b12x"
+                    "DGX Spark NVMe expert paging requires the FlashInfer "
+                    "CUTLASS MXFP8xMXFP4 backend; start vLLM with "
+                    "--moe-backend flashinfer_cutlass"
                 )
-            if self.experts_cls is None or self.experts_cls.__name__ != "B12xExperts":
+            if self.experts_cls is None or self.experts_cls.__name__ != "FlashInferExperts":
                 raise ValueError(
-                    "DGX Spark NVMe expert paging requires B12xExperts, got "
+                    "DGX Spark NVMe paging requires FlashInferExperts, got "
                     f"{self.experts_cls}"
                 )
             slots_text = os.environ.get(
@@ -779,7 +783,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.logical_num_experts,
             specs,
             identity={
-                "layout": "deepseek-v41-raw-mxfp4-v1",
+                "layout": "deepseek-v41-flashinfer-cutlass-mxfp4-mxfp8-v1",
                 "model": str(cfg.model_config.model),
                 "revision": str(cfg.model_config.revision),
                 "layer": layer.layer_name,
@@ -855,10 +859,57 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "w1:scale", "w2:scale", "w3:scale",
         }
         if parts == expected:
-            store.mark_expert_complete(expert_id)
+            self._convert_completed_nvme_expert(layer, expert_id)
             self._nvme_completed_experts.add(expert_id)
             del self._nvme_parts[expert_id]
         return True
+
+    def _convert_completed_nvme_expert(
+        self, layer: RoutedExperts, expert_id: int
+    ) -> None:
+        """Convert one raw checkpoint expert once, then persist runtime layout."""
+        store = self._nvme_store
+        assert store is not None
+        row = torch.empty(store.record_stride, dtype=torch.uint8, pin_memory=True)
+        store.read_working_record(expert_id, row)
+
+        device = layer.w13_weight.device
+        raw_w13 = store.field_view(row, "w13").unsqueeze(0).to(device)
+        raw_w2 = store.field_view(row, "w2").unsqueeze(0).to(device)
+        raw_w13_scale = store.field_view(row, "w13_scale").unsqueeze(0).to(device)
+        raw_w2_scale = store.field_view(row, "w2_scale").unsqueeze(0).to(device)
+
+        (
+            runtime_w13,
+            runtime_w2,
+            runtime_w13_scale,
+            runtime_w2_scale,
+            _,
+            _,
+        ) = convert_weight_to_mxfp4_moe_kernel_format(
+            mxfp4_backend=self.mxfp4_backend,
+            layer=layer,
+            w13_weight=raw_w13,
+            w2_weight=raw_w2,
+            w13_weight_scale=raw_w13_scale,
+            w2_weight_scale=raw_w2_scale,
+            _cache_permute_indices=self._cache_permute_indices,
+            activation=self.moe.activation,
+        )
+
+        store.field_view(row, "w13").copy_(
+            runtime_w13[0].detach().to("cpu").view(torch.uint8)
+        )
+        store.field_view(row, "w2").copy_(
+            runtime_w2[0].detach().to("cpu").view(torch.uint8)
+        )
+        store.field_view(row, "w13_scale").copy_(
+            runtime_w13_scale[0].detach().to("cpu").view(torch.uint8)
+        )
+        store.field_view(row, "w2_scale").copy_(
+            runtime_w2_scale[0].detach().to("cpu").view(torch.uint8)
+        )
+        store.write_record(expert_id, row)
 
     def _load_seed_slots(self, layer: RoutedExperts) -> None:
         store = self._nvme_store
@@ -984,12 +1035,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """Build the modular MoE kernel from the (already in-format) weights."""
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None and self.experts_cls is not None:
+            kernel_moe = self.moe
+            routing_tables = layer._expert_routing_tables()
+            if self._nvme_paging_enabled:
+                # Router stays in the original logical expert space while the
+                # FlashInfer expert kernel sees only the physical resident slots.
+                kernel_moe = replace(
+                    self.moe,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                    num_logical_experts=self.num_experts,
+                )
+                routing_tables = None
             self.moe_kernel = make_mxfp4_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
+                moe_config=kernel_moe,
                 mxfp4_backend=self.mxfp4_backend,
                 experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
+                routing_tables=routing_tables,
             )
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
@@ -1008,25 +1071,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             store.finalize()
             self._load_seed_slots(layer)
 
-            self._setup_kernel(
-                layer,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
+            # Disk records and seed slots are already in FlashInfer CUTLASS
+            # runtime layout, so do not call _setup_kernel (it would convert
+            # them a second time).
+            self._build_moe_kernel(layer)
+
+            from vllm.model_executor.layers.fused_moe.mxfp4_direct_disk_provider import (
+                FlashInferMxfp4DiskExpertProvider,
             )
 
-            from vllm.model_executor.layers.fused_moe.b12x_disk_provider import (
-                B12xDiskExpertProvider,
+            read_batch = int(
+                os.environ.get("VLLM_DSV41_NVME_EXPERT_READ_BATCH", "6")
             )
-
-            experts = self.moe_kernel.fused_experts
-            layer.expert_weight_provider = B12xDiskExpertProvider(
-                layer=layer,
+            layer.expert_weight_provider = FlashInferMxfp4DiskExpertProvider(
                 layer_id=int(layer.layer_name.split(".layers.", 1)[1].split(".", 1)[0]),
                 global_num_experts=self.logical_num_experts,
                 store=store,
-                b12x_experts=experts,
+                w13=layer.w13_weight,
+                w2=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                read_batch=read_batch,
             )
             return
 
@@ -1111,28 +1176,79 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         provider = layer.expert_weight_provider
         if provider is None:
-            w1 = layer.w13_weight
-            w2 = layer.w2_weight
-            expert_map = layer.expert_map
-        else:
-            prepared = provider.prepare(topk_ids)
-            w1 = prepared.w1
-            w2 = prepared.w2
-            expert_map = prepared.expert_map
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                expert_map=layer.expert_map,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
 
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=expert_map,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
-        )
+        groups = provider.partition(topk_ids)
+        if len(groups) == 1:
+            prepared = provider.prepare_keys(groups[0])
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=prepared.w1,
+                w2=prepared.w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                expert_map=prepared.expert_map,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+
+        # Wide prefill can touch more unique experts than the resident cache.
+        # Execute exact partial sums in cache-sized expert groups instead of
+        # thrashing the LRU one token at a time.
+        result = None
+        for group_index, group in enumerate(groups):
+            prepared = provider.prepare_keys(group)
+            group_ids = torch.tensor(
+                [key.expert_id for key in group],
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            active = torch.isin(topk_ids, group_ids)
+            fallback = group[0].expert_id
+            group_topk_ids = torch.where(
+                active, topk_ids, torch.full_like(topk_ids, fallback)
+            )
+            group_topk_weights = torch.where(
+                active, topk_weights, torch.zeros_like(topk_weights)
+            )
+            partial = self.moe_kernel.apply(
+                hidden_states=x,
+                w1=prepared.w1,
+                w2=prepared.w2,
+                topk_weights=group_topk_weights,
+                topk_ids=group_topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                expert_map=prepared.expert_map,
+                shared_experts=shared_experts if group_index == 0 else None,
+                shared_experts_input=(
+                    shared_experts_input if group_index == 0 else None
+                ),
+            )
+            if isinstance(partial, UnfinalizedMoEOutput):
+                raise RuntimeError(
+                    "partitioned NVMe prefill does not support deferred MoE finalize"
+                )
+            result = partial if result is None else result + partial
+
+        assert result is not None
+        return result
 
     def apply_monolithic(
         self,

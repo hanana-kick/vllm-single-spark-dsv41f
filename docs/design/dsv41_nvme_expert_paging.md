@@ -90,3 +90,28 @@ capability family 10.x, so it is not the execution path for this target.
 - CUDA graphs are not a target for the synchronous pager. Dynamic residency
   must first become correct in eager execution.
 - The B12X repack-on-miss path is a correctness baseline only.
+
+
+## Performance path update
+
+The DGX Spark path now targets `flashinfer_cutlass`, not B12X. SM121 is
+accepted by vLLM's FlashInfer CUTLASS MXFP4/MXFP8 experts implementation, and
+that kernel consumes the converted expert tensors directly.
+
+The disk store is therefore a runtime-layout cache:
+
+```
+first build:
+checkpoint w1/w2/w3 + scales
+  -> one-expert FlashInfer layout conversion
+  -> persistent NVMe runtime record
+
+runtime miss:
+NVMe record -> one resident slot -> expert_map update -> fused MoE
+```
+
+There is no all-slot B12X repack on a miss. Wide prefills whose per-layer
+expert union exceeds resident capacity are split into exact expert groups:
+non-group top-k weights are zeroed and the partial outputs are summed. This
+turns a large prefill into a small number of cache-sized MoE passes instead of
+LRU-thrashing token by token.

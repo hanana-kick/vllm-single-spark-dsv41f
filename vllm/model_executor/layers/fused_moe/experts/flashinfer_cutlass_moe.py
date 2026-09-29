@@ -202,6 +202,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
+    def supports_expert_map(self) -> bool:
+        return True
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -260,6 +263,14 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
+        if expert_map is not None:
+            # The pager admits the complete routed group before execution.
+            # Keep this remap device-only: a Python torch.any() check here
+            # would introduce a GPU synchronization on every MoE layer.
+            topk_ids = expert_map[topk_ids.to(dtype=torch.long)].to(
+                dtype=torch.int32
+            ).contiguous()
+
         quant_scales = None
         fc1_expert_weights = None
         fc2_expert_weights = None

@@ -8,8 +8,8 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-big}"
 PORT="${PORT:-8000}"
 CTX="${CTX:-8192}"
 MAX_SEQS="${MAX_SEQS:-1}"
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-8}"
-EXPERT_CACHE_SLOTS="${EXPERT_CACHE_SLOTS:-24}"
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-2048}"
+EXPERT_CACHE_SLOTS="${EXPERT_CACHE_SLOTS:-64}"
 ENGRAM_THREADS="${ENGRAM_THREADS:-32}"
 
 mkdir -p "${EXPERT_STORE_DIR}"
@@ -18,6 +18,7 @@ export VLLM_DSV41_NVME_EXPERT_STORE_DIR="${EXPERT_STORE_DIR}"
 export VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS="${EXPERT_CACHE_SLOTS}"
 # Buffered reads first. Enable O_DIRECT only after correctness is established.
 export VLLM_DSV41_NVME_DIRECT_IO="${VLLM_DSV41_NVME_DIRECT_IO:-0}"
+export VLLM_DSV41_NVME_EXPERT_READ_BATCH="${VLLM_DSV41_NVME_EXPERT_READ_BATCH:-8}"
 
 export VLLM_DSV41_ENGRAM_DISK=1
 export VLLM_DSV41_ENGRAM_DISK_DIR="${MODEL_DIR}"
@@ -28,7 +29,7 @@ exec vllm serve "${MODEL_DIR}" \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --tensor-parallel-size 1 \
-  --moe-backend b12x \
+  --moe-backend flashinfer_cutlass \
   --enforce-eager \
   --language-model-only \
   --max-model-len "${CTX}" \

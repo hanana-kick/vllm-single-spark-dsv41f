@@ -298,6 +298,28 @@ class DiskExpertStore:
             self.record_stride / (1 << 20),
         )
 
+    def read_working_record(self, expert_id: int, dst: torch.Tensor) -> int:
+        """Read one record while the streaming-build file is still open."""
+        self._check_expert_id(expert_id)
+        if self._wfd is None or self.is_complete:
+            raise RuntimeError("expert store has no active streaming writer")
+        if dst.device.type != "cpu":
+            raise ValueError("working-record destination must be a CPU tensor")
+        if dst.dtype != torch.uint8 or dst.numel() != self.record_stride:
+            raise ValueError(f"destination must be uint8[{self.record_stride}]")
+        view = memoryview(dst.numpy())
+        offset = expert_id * self.record_stride
+        got = 0
+        while got < self.record_stride:
+            nbytes = os.preadv(self._wfd, [view[got:]], offset + got)
+            if nbytes <= 0:
+                raise OSError(
+                    f"short working expert read: expert={expert_id} "
+                    f"{got}/{self.record_stride}"
+                )
+            got += nbytes
+        return got
+
     def read_record(self, expert_id: int, dst: torch.Tensor) -> int:
         """Read one complete record, preferring O_DIRECT when requested."""
         self._check_expert_id(expert_id)
