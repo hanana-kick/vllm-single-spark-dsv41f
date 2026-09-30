@@ -30,6 +30,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+        ExpertWeightProvider,
+    )
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
 
 
@@ -141,6 +144,11 @@ class RoutedExperts(PluggableLayer):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         # End random parameters
         self._loaded_expert_biases: set[str] = set()
+
+        # Optional runtime weight source. The default remains fully resident
+        # parameters; disk/CPU-backed implementations install a provider only
+        # after their fixed-address slot buffers and quant metadata are ready.
+        self.expert_weight_provider: "ExpertWeightProvider | None" = None
 
         self.quant_method = self._get_quant_method(
             self.layer_name,
@@ -649,6 +657,12 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        stream_loader = getattr(self.quant_method, "stream_expert_weight", None)
+        if stream_loader is not None and stream_loader(
+            self, loaded_weight, weight_name, shard_id, expert_id
+        ):
+            return True if return_success else None
+
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined

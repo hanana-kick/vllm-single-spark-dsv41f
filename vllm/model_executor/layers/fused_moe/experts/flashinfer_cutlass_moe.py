@@ -27,12 +27,58 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     flashinfer_cutlass_fused_moe,
     has_flashinfer_cutlass_fused_moe,
 )
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _remap_paged_expert_ids_kernel(
+    src_ids,
+    expert_map,
+    dst_ids,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < numel
+    expert_id = tl.load(src_ids + offs, mask=valid, other=-1).to(tl.int32)
+    routed = valid & (expert_id >= 0)
+    physical = tl.load(
+        expert_map + expert_id,
+        mask=routed,
+        other=-1,
+    ).to(tl.int32)
+    tl.store(dst_ids + offs, physical, mask=valid)
+
+
+def _remap_paged_expert_ids(
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+) -> torch.Tensor:
+    """Map logical expert IDs to resident slot IDs in one device kernel."""
+    if not topk_ids.is_contiguous():
+        topk_ids = topk_ids.contiguous()
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"unsupported topk_ids dtype {topk_ids.dtype}")
+    if expert_map.dtype != torch.int32 or not expert_map.is_contiguous():
+        raise TypeError("paged expert_map must be contiguous int32")
+
+    out = torch.empty_like(topk_ids, dtype=torch.int32)
+    numel = topk_ids.numel()
+    if numel:
+        _remap_paged_expert_ids_kernel[(triton.cdiv(numel, 256),)](
+            topk_ids,
+            expert_map,
+            out,
+            numel,
+            BLOCK=256,
+        )
+    return out
 
 
 def is_valid_flashinfer_cutlass_fused_moe(
@@ -202,6 +248,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
+    def supports_expert_map(self) -> bool:
+        return True
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -260,6 +309,12 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
+        if expert_map is not None:
+            # The pager admits the complete routed group before execution.
+            # Use one int32 remap kernel instead of dtype conversion + advanced
+            # indexing + dtype conversion on every MoE layer.
+            topk_ids = _remap_paged_expert_ids(topk_ids, expert_map)
+
         quant_scales = None
         fc1_expert_weights = None
         fc2_expert_weights = None

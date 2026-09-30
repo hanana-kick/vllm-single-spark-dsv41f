@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import weakref
+from concurrent.futures import Future
 from contextlib import ExitStack
 
 import numpy as np
@@ -30,6 +31,7 @@ from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.triton_utils import tl, triton
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
     EngramLayout,
@@ -46,6 +48,44 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _disk_engram_dequant_kernel(
+    weight,
+    scales,
+    gather,
+    out,
+    num_rows,
+    DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    source = tl.load(gather + row, mask=row < num_rows, other=-1).to(tl.int64)
+    owned = source >= 0
+    source = tl.maximum(source, 0)
+    valid = (row < num_rows) & owned & (cols < DIM)
+    value = tl.load(
+        weight + source * DIM + cols,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    scale_col = cols // QUANT_BLOCK
+    scale = tl.load(
+        scales + source * (DIM // QUANT_BLOCK) + scale_col,
+        mask=valid,
+        other=0,
+    )
+    # E8M0 stores the FP32 exponent byte directly.
+    scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    value = tl.where(owned, value * scale, 0.0)
+    tl.store(
+        out + row * DIM + cols,
+        value.to(tl.bfloat16),
+        mask=(row < num_rows) & (cols < DIM),
+    )
 
 
 def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
@@ -278,11 +318,36 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        disk_model_dir: str | None = None,
+        disk_layer_id: int | None = None,
     ) -> None:
-        self.cpu_offload = cpu_offload
+        self.disk_mode = os.environ.get("VLLM_DSV41_ENGRAM_DISK", "0") == "1"
+        if self.disk_mode and dp_shared_memory:
+            raise ValueError("disk-backed Engram does not support dp_shared_memory")
+        if self.disk_mode and get_tensor_model_parallel_world_size() != 1:
+            raise ValueError("disk-backed Engram baseline currently requires TP=1")
+        self.cpu_offload = cpu_offload and not self.disk_mode
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
         self._packed: torch.Tensor | None = None
+        self._disk = None
+        self._disk_future: (
+            Future[torch.Tensor]
+            | Future[tuple[torch.Tensor, torch.Tensor]]
+            | Future[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+            | None
+        ) = None
+        self._disk_future_tokens = 0
+        self._disk_gpu_dequant = (
+            os.environ.get("VLLM_DSV41_ENGRAM_GPU_DEQUANT", "1") != "0"
+        )
+        self._disk_raw_inflight: list[
+            tuple[torch.cuda.Event, tuple[torch.Tensor, ...]]
+        ] = []
+        if self.disk_mode:
+            # Base __init__ attaches this loader to the tiny placeholder
+            # Parameters; it intentionally does not copy the 200 GB tables.
+            self._weight_loader = self._disk_weight_loader
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -300,7 +365,33 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         super().__init__(num_embeddings, dim, head_sizes, block_size)
-        if cpu_offload:
+        if self.disk_mode:
+            if disk_model_dir is None or disk_layer_id is None:
+                raise ValueError(
+                    "disk-backed Engram requires VLLM_DSV41_ENGRAM_DISK_DIR "
+                    "and a checkpoint layer id"
+                )
+            from vllm.models.deepseek_v41.nvidia.engram_disk import DiskEngramTable
+
+            threads = int(os.environ.get("VLLM_DSV41_ENGRAM_DISK_THREADS", "32"))
+            self._disk = DiskEngramTable(
+                disk_model_dir,
+                layer_id=disk_layer_id,
+                dim=dim,
+                block_size=block_size,
+                row_start=self.vocab_start_idx,
+                num_rows=self.part_num_embeddings,
+                threads=threads,
+            )
+            logger.info(
+                "Engram table disk-backed: layer=%d rows=[%d,%d) %.2f GiB "
+                "not allocated in unified memory",
+                disk_layer_id,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+            )
+        if self.cpu_offload:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
@@ -314,12 +405,29 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                 "shared across DP replicas" if dp_shared_memory else "per rank",
             )
 
+    @staticmethod
+    def _disk_weight_loader(
+        param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        # The checkpoint iterator may still expose this mmap-backed tensor, but
+        # the payload is intentionally not copied into unified memory.
+        del param, loaded_weight
+
     def _get_shard_info(self) -> tuple[int, int]:
         if self.dp_size == 1:
             return super()._get_shard_info()
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.disk_mode:
+            # Preserve parameter names for AutoWeightsLoader without allocating
+            # the rank-local table. lookup() never reads these placeholders.
+            return (
+                torch.zeros(1, self.dim, dtype=torch.float8_e4m3fn, device="cpu"),
+                torch.zeros(
+                    1, self.dim // self.block_size, dtype=torch.uint8, device="cpu"
+                ),
+            )
         if self.dp_shared_memory:
             group = get_engram_dp_group()
             assert group is not None
@@ -374,6 +482,8 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             )
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.disk_mode:
+            raise RuntimeError("disk-backed Engram has no resident table storage")
         if self._shared_memory is not None:
             return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
         if not self.cpu_offload:
@@ -387,6 +497,118 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             self._view_src = src
         assert self._views is not None
         return self._views
+
+    def start_disk_lookup(self, indices: torch.Tensor) -> None:
+        if not self.disk_mode:
+            raise RuntimeError("start_disk_lookup requires disk-backed Engram")
+        if self._disk_future is not None:
+            raise RuntimeError("previous Engram disk lookup has not been consumed")
+        if self._disk_raw_inflight:
+            # Raw pinned buffers need only outlive their UVA dequant kernel.
+            # Reap completed launches without a host synchronization.
+            self._disk_raw_inflight = [
+                item
+                for item in self._disk_raw_inflight
+                if not item[0].query()
+            ]
+            # Bound pathological producer-ahead cases without forcing a sync
+            # in the normal one-step pipeline.
+            if len(self._disk_raw_inflight) > 4:
+                event, _ = self._disk_raw_inflight.pop(0)
+                event.synchronize()
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "disk-backed Engram performs host I/O and requires eager "
+                "execution for the correctness baseline"
+            )
+        assert self._disk is not None
+        num_tokens = indices.shape[0]
+        local_heads = self.part_n_hash_cols
+        head_end = min(self.head_start + local_heads, self.n_hash_cols)
+        ids = indices[:, self.head_start:head_end].detach()
+        if ids.device.type != "cpu" or ids.dtype != torch.int64:
+            ids = ids.to(device="cpu", dtype=torch.int64)
+        if ids.shape[1] < local_heads:
+            pad = torch.full(
+                (num_tokens, local_heads - ids.shape[1]),
+                -1,
+                dtype=torch.int64,
+            )
+            ids = torch.cat((ids, pad), dim=1)
+        flat = ids.reshape(-1)
+        owned = (flat >= self.vocab_start_idx) & (flat < self.vocab_end_idx)
+        local = torch.where(
+            owned, flat - self.vocab_start_idx, torch.zeros_like(flat)
+        )
+        self._disk_future = (
+            self._disk.submit_raw_rows_compact(local, owned)
+            if self._disk_gpu_dequant
+            else self._disk.submit_rows(local, owned)
+        )
+        self._disk_future_tokens = num_tokens
+
+    def finish_disk_lookup(self, out: torch.Tensor) -> None:
+        future = self._disk_future
+        if future is None:
+            raise RuntimeError("no pending Engram disk lookup")
+
+        num_tokens = self._disk_future_tokens
+        if self._disk_gpu_dequant:
+            raw_weight, raw_scales, gather = future.result()
+            # The pinned CPU tensors are the physical GB10 UMA allocation;
+            # expose compact unique rows and their gather map to CUDA without
+            # an H2D copy. Duplicate hash rows are dequantized from one source.
+            weight_uva = get_accelerator_view_from_cpu_tensor(
+                raw_weight.view(torch.float8_e4m3fn)
+            )
+            scales_uva = get_accelerator_view_from_cpu_tensor(raw_scales)
+            gather_uva = get_accelerator_view_from_cpu_tensor(gather)
+            num_rows = num_tokens * self.part_n_hash_cols
+            if num_rows:
+                block = triton.next_power_of_2(self.dim)
+                _disk_engram_dequant_kernel[(num_rows,)](
+                    weight_uva,
+                    scales_uva,
+                    gather_uva,
+                    out,
+                    num_rows,
+                    DIM=self.dim,
+                    QUANT_BLOCK=self.block_size,
+                    BLOCK=block,
+                    num_warps=4,
+                )
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream())
+            # Retain owners and CUDA views until the event completes.
+            self._disk_raw_inflight.append(
+                (
+                    done,
+                    (
+                        raw_weight,
+                        raw_scales,
+                        gather,
+                        weight_uva,
+                        scales_uva,
+                        gather_uva,
+                    ),
+                )
+            )
+        else:
+            rows = future.result().reshape(
+                num_tokens, self.part_n_hash_cols, self.dim
+            )
+            out[:num_tokens].copy_(rows, non_blocking=True)
+
+        self._disk_future = None
+        self._disk_future_tokens = 0
+
+    def lookup(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> None:
+        if not self.disk_mode:
+            return super().lookup(indices, out, background=background)
+        self.start_disk_lookup(indices)
+        self.finish_disk_lookup(out)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.dp_size == 1:
@@ -443,6 +665,13 @@ class Engram(BaseEngram):
     ) -> ParallelEngramEmbedding:
         engram_config = get_current_vllm_config().engram_config
         assert engram_config is not None
+        disk_enabled = os.environ.get("VLLM_DSV41_ENGRAM_DISK", "0") == "1"
+        disk_dir = os.environ.get("VLLM_DSV41_ENGRAM_DISK_DIR")
+        if disk_enabled and not disk_dir:
+            raise ValueError(
+                "VLLM_DSV41_ENGRAM_DISK=1 requires "
+                "VLLM_DSV41_ENGRAM_DISK_DIR=/path/to/model/snapshot"
+            )
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
@@ -450,6 +679,8 @@ class Engram(BaseEngram):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            disk_model_dir=disk_dir,
+            disk_layer_id=layout.layer_ids[layer_hash_index],
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
@@ -463,6 +694,9 @@ class Engram(BaseEngram):
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Prefetch local shared rows or the DP group's gathered hash IDs."""
+        if self.embed_tokens.disk_mode:
+            self.embed_tokens.start_disk_lookup(hash_ids)
+            return
         if self._prefetch_stream is None:
             return super().prepare_embeddings(hash_ids)
         rows = self.staged_rows[: hash_ids.shape[0]]
@@ -488,6 +722,10 @@ class Engram(BaseEngram):
         torch.cuda.current_stream().wait_event(event)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        if self.embed_tokens.disk_mode:
+            rows = self.staged_rows[:num_tokens]
+            self.embed_tokens.finish_disk_lookup(rows)
+            return rows
         if self._prefetch_done is not None:
             self._finish_prefetch(self._prefetch_done)
         if self.embed_tokens.dp_size > 1:

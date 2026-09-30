@@ -88,16 +88,34 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+
+        provider = layer.expert_weight_provider
+        if provider is None:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+            expert_map = layer.expert_map
+        else:
+            # Weight providers run outside the MoE kernel and may perform
+            # dynamic residency work (CPU/NVMe lookup, eviction, admission).
+            # Global top-k IDs stay unchanged; the provider returns the
+            # canonical global-expert -> physical-slot map understood by the
+            # existing expert-parallel kernels. This avoids the scale/index
+            # mismatch caused by remapping topk_ids themselves.
+            prepared = provider.prepare(topk_ids)
+            w1 = prepared.w1
+            w2 = prepared.w2
+            expert_map = prepared.expert_map
+
         return self.moe_kernel.apply(
             hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
+            w1=w1,
+            w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=layer.expert_map,
+            expert_map=expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
