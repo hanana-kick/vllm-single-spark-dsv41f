@@ -34,6 +34,57 @@ _NVME_IO_POOL = ThreadPoolExecutor(
     thread_name_prefix="vllm-dsv41-nvme",
 )
 
+# Model layers execute serially on a single Spark, so one process-wide aligned
+# look-ahead bank is enough. This avoids allocating ~read_batch x 19 MiB per
+# layer while still allowing the next expert group to overlap current compute.
+_PREFETCH_STAGING_LOCK = threading.Lock()
+_PREFETCH_STAGING_OWNER: torch.Tensor | None = None
+_PREFETCH_STAGING_VIEWS: list[torch.Tensor] = []
+_PREFETCH_STAGING_STRIDE = 0
+
+
+def _acquire_prefetch_staging(
+    count: int, record_stride: int
+) -> list[torch.Tensor]:
+    global _PREFETCH_STAGING_OWNER
+    global _PREFETCH_STAGING_VIEWS
+    global _PREFETCH_STAGING_STRIDE
+
+    if count <= 0:
+        return []
+    _PREFETCH_STAGING_LOCK.acquire()
+    try:
+        if (
+            _PREFETCH_STAGING_OWNER is None
+            or _PREFETCH_STAGING_STRIDE != record_stride
+            or len(_PREFETCH_STAGING_VIEWS) < count
+        ):
+            owner = torch.empty(
+                count * record_stride + 4096,
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+            shift = (-owner.data_ptr()) % 4096
+            base = owner[shift : shift + count * record_stride]
+            views = [
+                base[
+                    i * record_stride : (i + 1) * record_stride
+                ]
+                for i in range(count)
+            ]
+            assert all(view.data_ptr() % 4096 == 0 for view in views)
+            _PREFETCH_STAGING_OWNER = owner
+            _PREFETCH_STAGING_VIEWS = views
+            _PREFETCH_STAGING_STRIDE = record_stride
+        return _PREFETCH_STAGING_VIEWS[:count]
+    except Exception:
+        _PREFETCH_STAGING_LOCK.release()
+        raise
+
+
+def _release_prefetch_staging() -> None:
+    _PREFETCH_STAGING_LOCK.release()
+
 
 @dataclass
 class _InFlightSlotUse:
@@ -45,8 +96,9 @@ class _InFlightSlotUse:
 class _PrefetchedExpertGroup:
     required: tuple[ExpertPageKey, ...]
     plan: ExpertSlotPlan
-    futures: list[tuple[ExpertLoad, Future[tuple[bytearray, float]]]]
+    futures: list[tuple[ExpertLoad, torch.Tensor, Future[float]]]
     deferred_loads: tuple[ExpertLoad, ...]
+    has_staging_lease: bool
 
 
 class FlashInferMxfp4DiskExpertProvider:
@@ -431,17 +483,16 @@ class FlashInferMxfp4DiskExpertProvider:
             self._copy_done.record(torch.cuda.current_stream())
             self.disk_reads += len(batch)
 
-    def _read_record_buffer_timed(
-        self, expert_id: int
-    ) -> tuple[bytearray, float]:
+    def _read_record_into_timed(
+        self, expert_id: int, record: torch.Tensor
+    ) -> float:
         started = time.perf_counter()
-        buffer = self.store.read_record_buffer(expert_id)
-        return buffer, time.perf_counter() - started
+        self.store.read_record(expert_id, record)
+        return time.perf_counter() - started
 
     def _copy_buffer_to_slot(
-        self, buffer: bytearray, slot: int
+        self, record: torch.Tensor, slot: int
     ) -> None:
-        record = torch.frombuffer(buffer, dtype=torch.uint8)
         if self.uses_uva:
             assert self.cpu_backing is not None
             for name, backing in self.cpu_backing.items():
@@ -486,17 +537,27 @@ class FlashInferMxfp4DiskExpertProvider:
                 self.readahead_records += self.store.advise_records(
                     [load.key.expert_id for load in deferred]
                 )
+            staging = _acquire_prefetch_staging(
+                len(ahead), self.store.record_stride
+            )
             futures = [
                 (
                     load,
+                    record,
                     self._pool.submit(
-                        self._read_record_buffer_timed, load.key.expert_id
+                        self._read_record_into_timed,
+                        load.key.expert_id,
+                        record,
                     ),
                 )
-                for load in ahead
+                for load, record in zip(ahead, staging, strict=True)
             ]
             return _PrefetchedExpertGroup(
-                required, plan, futures, deferred
+                required,
+                plan,
+                futures,
+                deferred,
+                bool(ahead),
             )
 
     def activate_prefetch(
@@ -512,8 +573,8 @@ class FlashInferMxfp4DiskExpertProvider:
 
             wait_started = time.perf_counter()
             completed = [
-                (load, *future.result())
-                for load, future in prefetched.futures
+                (load, record, future.result())
+                for load, record, future in prefetched.futures
             ]
             host_wait = time.perf_counter() - wait_started
             # Reads in one prefetched group overlap in the shared executor.
@@ -525,7 +586,7 @@ class FlashInferMxfp4DiskExpertProvider:
                 self.prefetch_service_seconds += service
                 self.prefetch_wait_seconds += host_wait
                 self.prefetch_reads += len(completed)
-            records = [(load, buffer) for load, buffer, _ in completed]
+            records = [(load, record) for load, record, _ in completed]
 
             try:
                 if self.uses_uva and (records or prefetched.deferred_loads):
@@ -558,6 +619,9 @@ class FlashInferMxfp4DiskExpertProvider:
                 self._expert_map_cpu.fill_(-1)
                 self.expert_map.fill_(-1)
                 raise
+            finally:
+                if prefetched.has_staging_lease:
+                    _release_prefetch_staging()
 
             if prefetched.plan.loads or prefetched.plan.evictions:
                 self._publish_expert_map()
