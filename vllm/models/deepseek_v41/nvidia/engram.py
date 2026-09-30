@@ -31,6 +31,7 @@ from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.triton_utils import tl, triton
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
     EngramLayout,
@@ -47,6 +48,39 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _disk_engram_dequant_kernel(
+    weight,
+    scales,
+    out,
+    num_rows,
+    DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    valid = (row < num_rows) & (cols < DIM)
+    value = tl.load(
+        weight + row * DIM + cols,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    scale_col = cols // QUANT_BLOCK
+    scale = tl.load(
+        scales + row * (DIM // QUANT_BLOCK) + scale_col,
+        mask=valid,
+        other=0,
+    )
+    # E8M0 stores the FP32 exponent byte directly.
+    scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    tl.store(
+        out + row * DIM + cols,
+        (value * scale).to(tl.bfloat16),
+        mask=valid,
+    )
 
 
 def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
@@ -292,8 +326,17 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         self.use_thp = use_thp
         self._packed: torch.Tensor | None = None
         self._disk = None
-        self._disk_future: Future[torch.Tensor] | None = None
+        self._disk_future: (
+            Future[torch.Tensor]
+            | Future[tuple[torch.Tensor, torch.Tensor]]
+            | None
+        ) = None
         self._disk_future_tokens = 0
+        self._disk_gpu_dequant = (
+            os.environ.get("VLLM_DSV41_ENGRAM_GPU_DEQUANT", "1") != "0"
+        )
+        self._disk_raw_hold: tuple[torch.Tensor, ...] | None = None
+        self._disk_dequant_done: torch.cuda.Event | None = None
         if self.disk_mode:
             # Base __init__ attaches this loader to the tiny placeholder
             # Parameters; it intentionally does not copy the 200 GB tables.
@@ -453,6 +496,13 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             raise RuntimeError("start_disk_lookup requires disk-backed Engram")
         if self._disk_future is not None:
             raise RuntimeError("previous Engram disk lookup has not been consumed")
+        if self._disk_raw_hold is not None:
+            # Raw pinned rows must outlive the CUDA UVA dequant kernel. By the
+            # next model step this event is normally already complete.
+            assert self._disk_dequant_done is not None
+            self._disk_dequant_done.synchronize()
+            self._disk_raw_hold = None
+            self._disk_dequant_done = None
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "disk-backed Engram performs host I/O and requires eager "
@@ -477,17 +527,56 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         local = torch.where(
             owned, flat - self.vocab_start_idx, torch.zeros_like(flat)
         )
-        self._disk_future = self._disk.submit_rows(local, owned)
+        self._disk_future = (
+            self._disk.submit_raw_rows(local, owned)
+            if self._disk_gpu_dequant
+            else self._disk.submit_rows(local, owned)
+        )
         self._disk_future_tokens = num_tokens
 
     def finish_disk_lookup(self, out: torch.Tensor) -> None:
         future = self._disk_future
         if future is None:
             raise RuntimeError("no pending Engram disk lookup")
-        rows = future.result().reshape(
-            self._disk_future_tokens, self.part_n_hash_cols, self.dim
-        )
-        out[: self._disk_future_tokens].copy_(rows, non_blocking=True)
+
+        num_tokens = self._disk_future_tokens
+        if self._disk_gpu_dequant:
+            raw_weight, raw_scales = future.result()
+            # The pinned CPU tensors are the physical GB10 UMA allocation;
+            # expose them to CUDA without an H2D copy.
+            weight_uva = get_accelerator_view_from_cpu_tensor(
+                raw_weight.view(torch.float8_e4m3fn)
+            )
+            scales_uva = get_accelerator_view_from_cpu_tensor(raw_scales)
+            num_rows = num_tokens * self.part_n_hash_cols
+            if num_rows:
+                block = triton.next_power_of_2(self.dim)
+                _disk_engram_dequant_kernel[(num_rows,)](
+                    weight_uva,
+                    scales_uva,
+                    out,
+                    num_rows,
+                    DIM=self.dim,
+                    QUANT_BLOCK=self.block_size,
+                    BLOCK=block,
+                    num_warps=4,
+                )
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream())
+            self._disk_dequant_done = done
+            # Retain both owners and CUDA views until the event completes.
+            self._disk_raw_hold = (
+                raw_weight,
+                raw_scales,
+                weight_uva,
+                scales_uva,
+            )
+        else:
+            rows = future.result().reshape(
+                num_tokens, self.part_n_hash_cols, self.dim
+            )
+            out[:num_tokens].copy_(rows, non_blocking=True)
+
         self._disk_future = None
         self._disk_future_tokens = 0
 

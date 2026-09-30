@@ -240,6 +240,73 @@ class DiskEngramTable:
         """Submit a row gather so decoder compute can overlap the disk I/O."""
         return _ENGRAM_STAGE_POOL.submit(self.read_rows, local_rows, owned)
 
+    def submit_raw_rows(
+        self, local_rows: torch.Tensor, owned: torch.Tensor
+    ) -> Future[tuple[torch.Tensor, torch.Tensor]]:
+        """Submit raw FP8/E8M0 rows for GPU-side dequantization."""
+        return _ENGRAM_STAGE_POOL.submit(
+            self.read_raw_rows, local_rows, owned
+        )
+
+    def read_raw_rows(
+        self, local_rows: torch.Tensor, owned: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return expanded pinned raw weight/scale rows.
+
+        Keeping the checkpoint representation avoids CPU FP8->FP32->BF16 work.
+        The caller exposes these pinned buffers through CUDA UVA and performs
+        the exact E4M3 x E8M0 dequantization on the GPU.
+        """
+        local_rows = local_rows.to(device="cpu", dtype=torch.int64).reshape(-1)
+        owned = owned.to(device="cpu", dtype=torch.bool).reshape(-1)
+        if local_rows.numel() != owned.numel():
+            raise ValueError("local_rows and owned must have equal length")
+        count = local_rows.numel()
+        w_out = torch.zeros(
+            (count, self.dim), dtype=torch.uint8, pin_memory=True
+        )
+        s_out = torch.zeros(
+            (count, self.scale_cols), dtype=torch.uint8, pin_memory=True
+        )
+        if count == 0:
+            return w_out, s_out
+
+        valid_rows = local_rows[owned]
+        if valid_rows.numel() and (
+            int(valid_rows.min()) < 0 or int(valid_rows.max()) >= self.num_rows
+        ):
+            raise IndexError("Engram local row outside this rank's disk shard")
+        if not valid_rows.numel():
+            return w_out, s_out
+
+        unique, inverse = torch.unique(
+            valid_rows, sorted=True, return_inverse=True
+        )
+        unique_list = [int(v) for v in unique.tolist()]
+        runs = self._contiguous_runs(unique_list)
+
+        w_futures = self._submit_runs(
+            self.w_fd, self.w_base, runs, self.dim
+        )
+        s_futures = self._submit_runs(
+            self.s_fd, self.s_base, runs, self.scale_cols
+        )
+        w_rows = self._collect_runs(w_futures, self.dim)
+        s_rows = self._collect_runs(s_futures, self.scale_cols)
+
+        w_unique = torch.frombuffer(
+            bytearray(b"".join(w_rows[row] for row in unique_list)),
+            dtype=torch.uint8,
+        ).reshape(len(unique_list), self.dim)
+        s_unique = torch.frombuffer(
+            bytearray(b"".join(s_rows[row] for row in unique_list)),
+            dtype=torch.uint8,
+        ).reshape(len(unique_list), self.scale_cols)
+
+        w_out[owned] = w_unique[inverse]
+        s_out[owned] = s_unique[inverse]
+        return w_out, s_out
+
     def read_rows(
         self, local_rows: torch.Tensor, owned: torch.Tensor
     ) -> torch.Tensor:

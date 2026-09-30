@@ -110,3 +110,54 @@ def test_disk_engram_accepts_model_prefix_and_weight_scale_inv(tmp_path: Path):
         torch.tensor([0]), torch.tensor([True])
     ).shape == (1, 4)
     table.close()
+
+
+def test_disk_engram_raw_rows_preserve_fp8_and_scale_bytes(tmp_path: Path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_fake_safetensors(shard)
+    index = {
+        "weight_map": {
+            "layers.1.engram.embed.weight": shard.name,
+            "layers.1.engram.embed.scale": shard.name,
+        }
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    table = DiskEngramTable(
+        tmp_path,
+        layer_id=1,
+        dim=4,
+        block_size=2,
+        row_start=0,
+        num_rows=3,
+        threads=2,
+    )
+    weight, scale = table.read_raw_rows(
+        torch.tensor([2, 1, 2, 0], dtype=torch.int64),
+        torch.tensor([True, False, True, True]),
+    )
+
+    assert weight.is_pinned()
+    assert scale.is_pinned()
+    assert weight.shape == (4, 4)
+    assert scale.shape == (4, 2)
+    assert torch.equal(weight[1], torch.zeros(4, dtype=torch.uint8))
+    assert torch.equal(scale[1], torch.zeros(2, dtype=torch.uint8))
+    assert torch.equal(weight[0], weight[2])
+
+    decoded = weight.view(torch.float8_e4m3fn).to(torch.float32).reshape(4, 2, 2)
+    decoded_scale = (scale.to(torch.int32) << 23).view(torch.float32)
+    decoded = (decoded * decoded_scale[:, :, None]).reshape(4, 4).to(
+        torch.bfloat16
+    )
+    expected = torch.tensor(
+        [
+            [3.0, 4.0, 5.0, 6.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [3.0, 4.0, 5.0, 6.0],
+            [1.0, 2.0, 3.0, 4.0],
+        ],
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
+    table.close()
