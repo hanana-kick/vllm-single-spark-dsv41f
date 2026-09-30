@@ -240,6 +240,127 @@ class DiskEngramTable:
         """Submit a row gather so decoder compute can overlap the disk I/O."""
         return _ENGRAM_STAGE_POOL.submit(self.read_rows, local_rows, owned)
 
+    @staticmethod
+    def _pread_into(fd: int, offset: int, view: memoryview) -> int:
+        total = len(view)
+        got = 0
+        while got < total:
+            nbytes = os.preadv(fd, [view[got:]], offset + got)
+            if nbytes <= 0:
+                raise OSError(
+                    f"short Engram read at {offset}: {got}/{total}"
+                )
+            got += nbytes
+        if (
+            _DROP_ENGRAM_PAGE_CACHE
+            and hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            try:
+                os.posix_fadvise(
+                    fd, offset, total, os.POSIX_FADV_DONTNEED
+                )
+            except OSError:
+                pass
+        return got
+
+    def _submit_runs_into(
+        self,
+        fd: int,
+        base: int,
+        runs: list[tuple[int, int]],
+        row_bytes: int,
+        dst: torch.Tensor,
+    ) -> list[Future[int]]:
+        """Read sorted contiguous runs directly into a compact pinned tensor."""
+        raw = memoryview(dst.numpy()).cast("B")
+        futures: list[Future[int]] = []
+        cursor = 0
+        for start, end in runs:
+            rows = end - start
+            nbytes = rows * row_bytes
+            lo = cursor * row_bytes
+            futures.append(
+                self._pool.submit(
+                    self._pread_into,
+                    fd,
+                    base + start * row_bytes,
+                    raw[lo : lo + nbytes],
+                )
+            )
+            cursor += rows
+        return futures
+
+    def submit_raw_rows_compact(
+        self, local_rows: torch.Tensor, owned: torch.Tensor
+    ) -> Future[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Submit compact raw rows plus output-row -> unique-row mapping."""
+        return _ENGRAM_STAGE_POOL.submit(
+            self.read_raw_rows_compact, local_rows, owned
+        )
+
+    def read_raw_rows_compact(
+        self, local_rows: torch.Tensor, owned: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return unique raw rows and a pinned gather map.
+
+        The gather map has one int32 entry per requested output row. -1 means
+        the hash row is not owned by this table; otherwise it indexes the
+        compact unique weight/scale buffers.
+        """
+        local_rows = local_rows.to(device="cpu", dtype=torch.int64).reshape(-1)
+        owned = owned.to(device="cpu", dtype=torch.bool).reshape(-1)
+        if local_rows.numel() != owned.numel():
+            raise ValueError("local_rows and owned must have equal length")
+
+        count = local_rows.numel()
+        gather = torch.full(
+            (count,), -1, dtype=torch.int32, pin_memory=True
+        )
+        valid_rows = local_rows[owned]
+        if valid_rows.numel() and (
+            int(valid_rows.min()) < 0 or int(valid_rows.max()) >= self.num_rows
+        ):
+            raise IndexError("Engram local row outside this rank's disk shard")
+        if not valid_rows.numel():
+            return (
+                torch.empty(
+                    (0, self.dim), dtype=torch.uint8, pin_memory=True
+                ),
+                torch.empty(
+                    (0, self.scale_cols), dtype=torch.uint8, pin_memory=True
+                ),
+                gather,
+            )
+
+        unique, inverse = torch.unique(
+            valid_rows, sorted=True, return_inverse=True
+        )
+        unique_list = [int(v) for v in unique.tolist()]
+        runs = self._contiguous_runs(unique_list)
+
+        weights = torch.empty(
+            (len(unique_list), self.dim),
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        scales = torch.empty(
+            (len(unique_list), self.scale_cols),
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        futures = self._submit_runs_into(
+            self.w_fd, self.w_base, runs, self.dim, weights
+        )
+        futures += self._submit_runs_into(
+            self.s_fd, self.s_base, runs, self.scale_cols, scales
+        )
+        for future in futures:
+            future.result()
+
+        gather[owned] = inverse.to(dtype=torch.int32)
+        return weights, scales, gather
+
     def submit_raw_rows(
         self, local_rows: torch.Tensor, owned: torch.Tensor
     ) -> Future[tuple[torch.Tensor, torch.Tensor]]:
@@ -251,60 +372,22 @@ class DiskEngramTable:
     def read_raw_rows(
         self, local_rows: torch.Tensor, owned: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return expanded pinned raw weight/scale rows.
-
-        Keeping the checkpoint representation avoids CPU FP8->FP32->BF16 work.
-        The caller exposes these pinned buffers through CUDA UVA and performs
-        the exact E4M3 x E8M0 dequantization on the GPU.
-        """
-        local_rows = local_rows.to(device="cpu", dtype=torch.int64).reshape(-1)
-        owned = owned.to(device="cpu", dtype=torch.bool).reshape(-1)
-        if local_rows.numel() != owned.numel():
-            raise ValueError("local_rows and owned must have equal length")
-        count = local_rows.numel()
+        """Compatibility wrapper expanding compact rows on the CPU."""
+        weights, scales, gather = self.read_raw_rows_compact(
+            local_rows, owned
+        )
+        count = gather.numel()
         w_out = torch.zeros(
             (count, self.dim), dtype=torch.uint8, pin_memory=True
         )
         s_out = torch.zeros(
             (count, self.scale_cols), dtype=torch.uint8, pin_memory=True
         )
-        if count == 0:
-            return w_out, s_out
-
-        valid_rows = local_rows[owned]
-        if valid_rows.numel() and (
-            int(valid_rows.min()) < 0 or int(valid_rows.max()) >= self.num_rows
-        ):
-            raise IndexError("Engram local row outside this rank's disk shard")
-        if not valid_rows.numel():
-            return w_out, s_out
-
-        unique, inverse = torch.unique(
-            valid_rows, sorted=True, return_inverse=True
-        )
-        unique_list = [int(v) for v in unique.tolist()]
-        runs = self._contiguous_runs(unique_list)
-
-        w_futures = self._submit_runs(
-            self.w_fd, self.w_base, runs, self.dim
-        )
-        s_futures = self._submit_runs(
-            self.s_fd, self.s_base, runs, self.scale_cols
-        )
-        w_rows = self._collect_runs(w_futures, self.dim)
-        s_rows = self._collect_runs(s_futures, self.scale_cols)
-
-        w_unique = torch.frombuffer(
-            bytearray(b"".join(w_rows[row] for row in unique_list)),
-            dtype=torch.uint8,
-        ).reshape(len(unique_list), self.dim)
-        s_unique = torch.frombuffer(
-            bytearray(b"".join(s_rows[row] for row in unique_list)),
-            dtype=torch.uint8,
-        ).reshape(len(unique_list), self.scale_cols)
-
-        w_out[owned] = w_unique[inverse]
-        s_out[owned] = s_unique[inverse]
+        valid = gather >= 0
+        if valid.any():
+            indices = gather[valid].to(dtype=torch.long)
+            w_out[valid] = weights[indices]
+            s_out[valid] = scales[indices]
         return w_out, s_out
 
     def read_rows(

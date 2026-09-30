@@ -54,6 +54,7 @@ logger = init_logger(__name__)
 def _disk_engram_dequant_kernel(
     weight,
     scales,
+    gather,
     out,
     num_rows,
     DIM: tl.constexpr,
@@ -62,24 +63,28 @@ def _disk_engram_dequant_kernel(
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
-    valid = (row < num_rows) & (cols < DIM)
+    source = tl.load(gather + row, mask=row < num_rows, other=-1).to(tl.int64)
+    owned = source >= 0
+    source = tl.maximum(source, 0)
+    valid = (row < num_rows) & owned & (cols < DIM)
     value = tl.load(
-        weight + row * DIM + cols,
+        weight + source * DIM + cols,
         mask=valid,
         other=0.0,
     ).to(tl.float32)
     scale_col = cols // QUANT_BLOCK
     scale = tl.load(
-        scales + row * (DIM // QUANT_BLOCK) + scale_col,
+        scales + source * (DIM // QUANT_BLOCK) + scale_col,
         mask=valid,
         other=0,
     )
     # E8M0 stores the FP32 exponent byte directly.
     scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    value = tl.where(owned, value * scale, 0.0)
     tl.store(
         out + row * DIM + cols,
-        (value * scale).to(tl.bfloat16),
-        mask=valid,
+        value.to(tl.bfloat16),
+        mask=(row < num_rows) & (cols < DIM),
     )
 
 
@@ -329,6 +334,7 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         self._disk_future: (
             Future[torch.Tensor]
             | Future[tuple[torch.Tensor, torch.Tensor]]
+            | Future[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
             | None
         ) = None
         self._disk_future_tokens = 0
@@ -535,7 +541,7 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             owned, flat - self.vocab_start_idx, torch.zeros_like(flat)
         )
         self._disk_future = (
-            self._disk.submit_raw_rows(local, owned)
+            self._disk.submit_raw_rows_compact(local, owned)
             if self._disk_gpu_dequant
             else self._disk.submit_rows(local, owned)
         )
@@ -548,19 +554,22 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
 
         num_tokens = self._disk_future_tokens
         if self._disk_gpu_dequant:
-            raw_weight, raw_scales = future.result()
+            raw_weight, raw_scales, gather = future.result()
             # The pinned CPU tensors are the physical GB10 UMA allocation;
-            # expose them to CUDA without an H2D copy.
+            # expose compact unique rows and their gather map to CUDA without
+            # an H2D copy. Duplicate hash rows are dequantized from one source.
             weight_uva = get_accelerator_view_from_cpu_tensor(
                 raw_weight.view(torch.float8_e4m3fn)
             )
             scales_uva = get_accelerator_view_from_cpu_tensor(raw_scales)
+            gather_uva = get_accelerator_view_from_cpu_tensor(gather)
             num_rows = num_tokens * self.part_n_hash_cols
             if num_rows:
                 block = triton.next_power_of_2(self.dim)
                 _disk_engram_dequant_kernel[(num_rows,)](
                     weight_uva,
                     scales_uva,
+                    gather_uva,
                     out,
                     num_rows,
                     DIM=self.dim,
@@ -570,15 +579,17 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                 )
             done = torch.cuda.Event()
             done.record(torch.cuda.current_stream())
-            # Retain both owners and CUDA views until the event completes.
+            # Retain owners and CUDA views until the event completes.
             self._disk_raw_inflight.append(
                 (
                     done,
                     (
                         raw_weight,
                         raw_scales,
+                        gather,
                         weight_uva,
                         scales_uva,
+                        gather_uva,
                     ),
                 )
             )

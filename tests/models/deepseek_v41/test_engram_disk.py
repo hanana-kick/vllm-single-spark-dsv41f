@@ -161,3 +161,38 @@ def test_disk_engram_raw_rows_preserve_fp8_and_scale_bytes(tmp_path: Path):
     )
     torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
     table.close()
+
+
+def test_disk_engram_compact_raw_rows_deduplicate_and_map(tmp_path: Path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_fake_safetensors(shard)
+    index = {
+        "weight_map": {
+            "layers.1.engram.embed.weight": shard.name,
+            "layers.1.engram.embed.scale": shard.name,
+        }
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    table = DiskEngramTable(
+        tmp_path,
+        layer_id=1,
+        dim=4,
+        block_size=2,
+        row_start=0,
+        num_rows=3,
+        threads=2,
+    )
+    weight, scale, gather = table.read_raw_rows_compact(
+        torch.tensor([2, 1, 2, 0], dtype=torch.int64),
+        torch.tensor([True, False, True, True]),
+    )
+
+    assert weight.is_pinned()
+    assert scale.is_pinned()
+    assert gather.is_pinned()
+    # Owned rows are {0, 2}; duplicates do not duplicate raw payload storage.
+    assert weight.shape == (2, 4)
+    assert scale.shape == (2, 2)
+    assert gather.tolist() == [1, -1, 1, 0]
+    table.close()
