@@ -142,16 +142,65 @@ class DiskEngramTable:
         )
 
     @staticmethod
-    def _pread_row(fd: int, offset: int, size: int) -> bytes:
+    def _pread_exact(fd: int, offset: int, size: int) -> bytes:
         data = os.pread(fd, size, offset)
         if len(data) != size:
             raise OSError(f"short Engram read at {offset}: {len(data)}/{size}")
         return data
 
+    @staticmethod
+    def _contiguous_runs(rows: list[int]) -> list[tuple[int, int]]:
+        """Convert sorted unique row ids to inclusive-start/exclusive-end runs."""
+        if not rows:
+            return []
+        runs: list[tuple[int, int]] = []
+        start = prev = rows[0]
+        for row in rows[1:]:
+            if row != prev + 1:
+                runs.append((start, prev + 1))
+                start = row
+            prev = row
+        runs.append((start, prev + 1))
+        return runs
+
+    def _read_runs(
+        self,
+        fd: int,
+        base: int,
+        runs: list[tuple[int, int]],
+        row_bytes: int,
+    ) -> dict[int, bytes]:
+        """Read contiguous row runs with one pread per run."""
+        futures = [
+            (
+                start,
+                end,
+                self._pool.submit(
+                    self._pread_exact,
+                    fd,
+                    base + start * row_bytes,
+                    (end - start) * row_bytes,
+                ),
+            )
+            for start, end in runs
+        ]
+        result: dict[int, bytes] = {}
+        for start, end, future in futures:
+            block = future.result()
+            for i, row in enumerate(range(start, end)):
+                lo = i * row_bytes
+                result[row] = block[lo : lo + row_bytes]
+        return result
+
     def read_rows(
         self, local_rows: torch.Tensor, owned: torch.Tensor
     ) -> torch.Tensor:
-        """Return BF16 [R, dim], zeroing rows not owned by this shard."""
+        """Return BF16 [R, dim], zeroing rows not owned by this shard.
+
+        Unique row ids are sorted and adjacent ids are coalesced into one
+        positional read. Long prefills therefore issue roughly one syscall per
+        contiguous run instead of two syscalls per hash row.
+        """
         local_rows = local_rows.to(device="cpu", dtype=torch.int64).reshape(-1)
         owned = owned.to(device="cpu", dtype=torch.bool).reshape(-1)
         if local_rows.numel() != owned.numel():
@@ -166,28 +215,28 @@ class DiskEngramTable:
         ):
             raise IndexError("Engram local row outside this rank's disk shard")
 
-        unique, inverse = torch.unique(valid_rows, sorted=False, return_inverse=True)
-        unique_list = [int(v) for v in unique.tolist()]
-
-        w_futures = [
-            self._pool.submit(
-                self._pread_row, self.w_fd, self.w_base + row * self.dim, self.dim
+        if valid_rows.numel():
+            unique, inverse = torch.unique(
+                valid_rows, sorted=True, return_inverse=True
             )
-            for row in unique_list
-        ]
-        s_futures = [
-            self._pool.submit(
-                self._pread_row,
+            unique_list = [int(v) for v in unique.tolist()]
+            runs = self._contiguous_runs(unique_list)
+
+            w_future = self._pool.submit(
+                self._read_runs, self.w_fd, self.w_base, runs, self.dim
+            )
+            s_future = self._pool.submit(
+                self._read_runs,
                 self.s_fd,
-                self.s_base + row * self.scale_cols,
+                self.s_base,
+                runs,
                 self.scale_cols,
             )
-            for row in unique_list
-        ]
+            w_rows = w_future.result()
+            s_rows = s_future.result()
 
-        if unique_list:
-            w_bytes = b"".join(f.result() for f in w_futures)
-            s_bytes = b"".join(f.result() for f in s_futures)
+            w_bytes = b"".join(w_rows[row] for row in unique_list)
+            s_bytes = b"".join(s_rows[row] for row in unique_list)
             w = torch.frombuffer(bytearray(w_bytes), dtype=torch.uint8).reshape(
                 len(unique_list), self.dim
             )
@@ -202,6 +251,7 @@ class DiskEngramTable:
                 len(unique_list), self.dim
             )
         else:
+            inverse = torch.empty((0,), dtype=torch.int64)
             dequant = torch.empty((0, self.dim), dtype=torch.float32)
 
         out = torch.zeros((count, self.dim), dtype=torch.bfloat16)
