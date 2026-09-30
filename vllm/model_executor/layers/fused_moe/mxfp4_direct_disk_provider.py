@@ -153,6 +153,7 @@ class FlashInferMxfp4DiskExpertProvider:
         self.prefetch_service_seconds = 0.0
         self.prefetch_wait_seconds = 0.0
         self.prefetch_reads = 0
+        self.readahead_records = 0
         self.prepare_calls = 0
         self.stats_every = int(
             os.environ.get("VLLM_DSV41_NVME_STATS_EVERY", "0")
@@ -404,6 +405,10 @@ class FlashInferMxfp4DiskExpertProvider:
             # Only the first read_batch records overlap current compute.
             ahead = loads[: self.read_batch]
             deferred = tuple(loads[self.read_batch :])
+            if deferred:
+                self.readahead_records += self.store.advise_records(
+                    [load.key.expert_id for load in deferred]
+                )
             futures = [
                 (
                     load,
@@ -505,7 +510,7 @@ class FlashInferMxfp4DiskExpertProvider:
             "DSV4.1 NVMe layer=%d calls=%d hit=%.1f%% "
             "reads=%d (%.2f GiB) read=%.2f GB/s slots=%d UVA=%s "
             "prefetch_reads=%d hidden=%.1f%% wait=%.1fms "
-            "direct=%d buffered=%d",
+            "readahead=%d direct=%d buffered=%d",
             self.layer_id,
             self.prepare_calls,
             hit_rate,
@@ -517,6 +522,7 @@ class FlashInferMxfp4DiskExpertProvider:
             self.prefetch_reads,
             hidden_pct,
             self.prefetch_wait_seconds * 1000.0,
+            self.readahead_records,
             self.store.direct_field_reads,
             self.store.buffered_field_reads,
         )

@@ -443,6 +443,52 @@ class DiskExpertStore:
         self.buffered_field_reads += 1
         return read_total
 
+    def advise_records(self, expert_ids: list[int]) -> int:
+        """Ask Linux to start reading buffered expert records ahead of use.
+
+        The advisory path is used only for buffered I/O. O_DIRECT deliberately
+        bypasses page cache, so issuing WILLNEED there would only duplicate
+        traffic. Adjacent expert ids are coalesced into one range hint.
+        """
+        if (
+            self.direct_io
+            or not expert_ids
+            or not hasattr(os, "posix_fadvise")
+            or not hasattr(os, "POSIX_FADV_WILLNEED")
+        ):
+            return 0
+
+        ids = sorted(set(int(expert_id) for expert_id in expert_ids))
+        for expert_id in ids:
+            self._check_expert_id(expert_id)
+
+        fd = self._open_buffered_reader()
+        hinted = 0
+        start = prev = ids[0]
+        runs: list[tuple[int, int]] = []
+        for expert_id in ids[1:]:
+            if expert_id != prev + 1:
+                runs.append((start, prev + 1))
+                start = expert_id
+            prev = expert_id
+        runs.append((start, prev + 1))
+
+        for first, end in runs:
+            offset = first * self.record_stride
+            length = (end - first) * self.record_stride
+            try:
+                os.posix_fadvise(
+                    fd,
+                    offset,
+                    length,
+                    os.POSIX_FADV_WILLNEED,
+                )
+                hinted += end - first
+            except OSError:
+                # Advisory only. A later positional read remains authoritative.
+                pass
+        return hinted
+
     def read_record_buffer(self, expert_id: int) -> bytearray:
         """Read one complete record into an owned buffered-I/O bytearray.
 
