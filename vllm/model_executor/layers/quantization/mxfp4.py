@@ -657,6 +657,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "VLLM_DSV41_NVME_UVA_SLOTS=1 requires CUDA UVA host mapping"
             )
         slot_backing: dict[str, torch.Tensor] = {}
+        slot_backing_owners: list[torch.Tensor] = []
 
         def make_slot_parameter(
             name: str,
@@ -668,12 +669,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     torch.zeros(*shape, dtype=dtype),
                     requires_grad=False,
                 )
-            backing = torch.zeros(
-                *shape,
-                dtype=dtype,
+
+            # O_DIRECT can target the UVA backing itself when every slot starts
+            # on a filesystem block boundary. Over-allocate one pinned byte
+            # buffer and carve a 4 KiB-aligned contiguous tensor view from it.
+            numel = 1
+            for dim in shape:
+                numel *= dim
+            element_size = torch.empty((), dtype=dtype).element_size()
+            nbytes = numel * element_size
+            owner = torch.zeros(
+                nbytes + 4096,
+                dtype=torch.uint8,
                 device="cpu",
                 pin_memory=True,
             )
+            shift = (-owner.data_ptr()) % 4096
+            raw = owner[shift : shift + nbytes]
+            backing = raw.view(dtype).reshape(shape)
+            assert backing.is_contiguous()
+            assert backing.data_ptr() % 4096 == 0
+            slot_backing_owners.append(owner)
+
             view = get_accelerator_view_from_cpu_tensor(backing)
             slot_backing[name] = backing
             return torch.nn.Parameter(view, requires_grad=False)
@@ -772,6 +789,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer._dsv41_nvme_paging = True
             if self._nvme_uva_slots:
                 layer._dsv41_nvme_cpu_backing = slot_backing
+                # Keep the over-allocation that owns every aligned view alive.
+                layer._dsv41_nvme_cpu_backing_owners = slot_backing_owners
             self._init_nvme_expert_store(layer)
 
     def _init_nvme_expert_store(self, layer: RoutedExperts) -> None:

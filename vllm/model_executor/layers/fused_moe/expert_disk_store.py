@@ -330,12 +330,13 @@ class DiskExpertStore:
         expert_id: int,
         destinations: Mapping[str, torch.Tensor],
     ) -> int:
-        """Read record fields directly into CPU tensors using buffered preadv.
+        """Read one expert directly into its field tensors.
 
-        This is used by GB10 UVA expert slots: the CPU tensors are the backing
-        storage of the CUDA-visible weights, so no staging or H2D copy is
-        needed. Buffered I/O is intentional because individual field iovecs
-        are not guaranteed to satisfy O_DIRECT alignment constraints.
+        GB10 UVA slots are 4 KiB-aligned by the paging allocator. When the
+        runtime-layout field sizes/offsets are also aligned, one O_DIRECT
+        preadv can populate the actual resident slot without page-cache
+        residency, staging, or H2D. Unsupported filesystems/alignment fall
+        back to the buffered path after the first failed attempt.
         """
         self._check_expert_id(expert_id)
         if not self.is_complete:
@@ -347,6 +348,7 @@ class DiskExpertStore:
 
         views: list[memoryview] = []
         total = 0
+        direct_compatible = self.direct_io
         for field in self.fields.values():
             dst = destinations[field.name]
             if dst.device.type != "cpu" or not dst.is_contiguous():
@@ -359,35 +361,74 @@ class DiskExpertStore:
                     f"{field.name} destination has {raw.numel()} bytes, "
                     f"expected {field.nbytes}"
                 )
+            direct_compatible &= (
+                raw.data_ptr() % ALIGN == 0
+                and field.offset % ALIGN == 0
+                and field.nbytes % ALIGN == 0
+            )
             view = memoryview(raw.numpy()).cast("B")
             views.append(view)
             total += len(view)
 
-        fd = self._open_buffered_reader()
         file_offset = expert_id * self.record_stride
-        pending = views
-        read_total = 0
-        while pending:
-            count = os.preadv(fd, pending, file_offset + read_total)
-            if count <= 0:
-                raise OSError(
-                    f"short expert field read: expert={expert_id} "
-                    f"{read_total}/{total}"
-                )
-            read_total += count
+        direct_compatible &= (
+            file_offset % ALIGN == 0
+            and total % ALIGN == 0
+        )
 
-            consumed = count
-            next_pending: list[memoryview] = []
-            for view in pending:
-                if consumed >= len(view):
-                    consumed -= len(view)
-                    continue
-                if consumed:
-                    view = view[consumed:]
-                    consumed = 0
-                next_pending.append(view)
-            pending = next_pending
+        def preadv_all(fd: int) -> int:
+            pending = views
+            read_total = 0
+            while pending:
+                count = os.preadv(fd, pending, file_offset + read_total)
+                if count <= 0:
+                    raise OSError(
+                        f"short expert field read: expert={expert_id} "
+                        f"{read_total}/{total}"
+                    )
+                read_total += count
 
+                consumed = count
+                next_pending: list[memoryview] = []
+                for view in pending:
+                    if consumed >= len(view):
+                        consumed -= len(view)
+                        continue
+                    if consumed:
+                        view = view[consumed:]
+                        consumed = 0
+                    next_pending.append(view)
+                pending = next_pending
+            return read_total
+
+        if direct_compatible:
+            fd = self._open_reader()
+            if self._using_direct_io:
+                try:
+                    read_total = preadv_all(fd)
+                    if read_total != total:
+                        raise OSError(
+                            f"expert direct read size mismatch: "
+                            f"{read_total}/{total}"
+                        )
+                    return read_total
+                except OSError as exc:
+                    logger.warning_once(
+                        "O_DIRECT UVA expert reads failed for %s (%s); "
+                        "falling back to buffered preadv.",
+                        self.path,
+                        exc,
+                    )
+                    with self._open_lock:
+                        if self._fd is not None:
+                            os.close(self._fd)
+                            self._fd = None
+                        self._using_direct_io = False
+                        # Do not retry O_DIRECT on every expert miss.
+                        self.direct_io = False
+
+        fd = self._open_buffered_reader()
+        read_total = preadv_all(fd)
         if read_total != total:
             raise OSError(
                 f"expert field read size mismatch: {read_total}/{total}"
