@@ -24,12 +24,13 @@ export EXPERT_STORE_DIR=/fast-nvme/dsv41-expert-store
 bash scripts/dsv41_single_spark_nvme.sh
 ```
 
-Why 64 slots rather than 64: the correctness baseline retains both the raw
-slot tensors and FlashInfer CUTLASS's prepared/packed representation. One original V4.1
-routed expert is roughly 19 MB across its tensors; 64 slots x 40 routed
-layers is roughly 18 GB of raw cache before the FlashInfer CUTLASS packed copy and runtime
-buffers. 64 slots per layer is too aggressive as a default on a 128 GB UMA
-machine.
+The default 64 slots/layer is a performance-oriented starting point, not a
+small cache. One released V4.1 routed expert is roughly 19 MiB across its
+runtime tensors, so 64 slots across 40 routed layers is on the order of
+47 GiB. The current FlashInfer CUTLASS path consumes those runtime-layout slot
+tensors directly; there is no second all-slot B12X packed copy. Context, dense
+weights, staging buffers and the OS still need headroom, so reduce
+`EXPERT_CACHE_SLOTS` if the Spark approaches memory pressure.
 
 The environment variable
 `VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS` is mandatory in the engine itself when
@@ -70,8 +71,8 @@ After the single-request output is validated, raise in this order:
 1. context to 32K then 128K/262K;
 2. `MAX_SEQS=2` then 4/8 while keeping small batched-token limits;
 3. vision;
-4. asynchronous/batched expert reads;
-5. incremental FlashInfer CUTLASS packed-slot updates;
+4. multiple active requests and larger contexts;
+5. vision;
 6. DSpark;
 7. CUDA graphs.
 
@@ -86,6 +87,13 @@ MAX_BATCHED_TOKENS=8192
 EXPERT_CACHE_SLOTS=64
 ENGRAM_THREADS=32
 GPU_MEMORY_UTILIZATION=0.70
+
+# Advanced I/O controls
+VLLM_DSV41_NVME_EXPERT_READ_BATCH=8
+VLLM_DSV41_NVME_IO_WORKERS=32
+VLLM_DSV41_ENGRAM_STAGE_WORKERS=4
+VLLM_DSV41_NVME_DROP_PAGE_CACHE=1
+VLLM_DSV41_ENGRAM_DROP_PAGE_CACHE=1
 ```
 
 If a prefill batch routes to more unique experts in one layer than the
@@ -138,3 +146,24 @@ DSV4.1 NVMe layer=... hit=...% reads=... (... GiB) read=... GB/s slots=... UVA=.
 
 This separates three important causes of slow decode: insufficient resident
 hit rate, low effective NVMe throughput, and compute outside the pager.
+
+## Current overlap behavior
+
+The branch currently overlaps storage and compute in three places:
+
+- wide prefill starts the next expert group's bounded NVMe read while
+  FlashInfer computes the current group;
+- mixed hit/miss decode starts cold-expert reads while the already-resident
+  routed contribution is computed;
+- disk-backed Engram submits all local Engram table reads before the decoder
+  layers and consumes each future only when its layer is reached.
+
+Look-ahead expert records are capped at
+`VLLM_DSV41_NVME_EXPERT_READ_BATCH` so a 64-slot group cannot transiently
+buffer more than a GiB of expert records. Remaining misses use the ordinary
+bounded loader after the overlapped first batch.
+
+Buffered expert and Engram reads default to
+`POSIX_FADV_DONTNEED` after consumption. On GB10 this avoids retaining a
+second Linux page-cache copy of weights that already have an explicit resident
+expert cache. Set either `*_DROP_PAGE_CACHE=0` only for A/B testing.

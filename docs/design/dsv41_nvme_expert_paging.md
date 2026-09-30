@@ -47,58 +47,68 @@ half-wired offload mode visible to users.
 
 ## Current experimental switch
 
-The first correctness path is intentionally opt-in and GB10/B12X-specific:
+The active DGX Spark path is opt-in and restricted to DeepSeek V4.1, TP1/EP1
+and the FlashInfer CUTLASS MXFP8×MXFP4 backend:
 
 ```bash
 export VLLM_DSV41_NVME_EXPERT_STORE_DIR=/fast-nvme/dsv41-experts
 export VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS=64
-export VLLM_DSV41_NVME_DIRECT_IO=1
+export VLLM_DSV41_NVME_EXPERT_READ_BATCH=8
+export VLLM_DSV41_NVME_UVA_SLOTS=1
+export VLLM_DSV41_ENGRAM_DISK=1
+export VLLM_DSV41_ENGRAM_DISK_DIR=/path/to/model/snapshot
 
-# Force the SM12x MoE implementation used by the paging baseline.
-# Other model/parallel configurations fail closed when the env var is set.
-vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
-  --moe-backend b12x
+vllm serve /path/to/model/snapshot \
+  --moe-backend flashinfer_cutlass \
+  --tensor-parallel-size 1 \
+  --enforce-eager
 ```
 
-This is not yet a performance configuration. On every cache miss it:
+The official safetensors are the source of truth. Routed experts are converted
+once, expert-by-expert, to the exact FlashInfer runtime layout and persisted in
+a fixed-stride NVMe store. No GGUF/Q2 weights and no expert pruning are used.
 
-1. reads the selected raw MXFP4 expert record into one pinned staging buffer;
-2. copies it into a fixed raw slot;
-3. asks the existing B12X `prepare_weights()` implementation to repack the
-   complete resident slot array; and
-4. remaps the original global expert ids to physical slots only at the B12X
-   expert-kernel boundary.
+On GB10, the default slot mode uses pinned CPU backing exposed to CUDA through
+UVA:
 
-Repacking all slots on a miss is deliberately expensive. It avoids inventing a
-second B12X packed format and gives the project a correctness oracle before
-incremental packed-slot updates, asynchronous I/O, and batch miss coalescing.
+```text
+NVMe -> pinned GB10 UMA slot -> CUDA UVA view -> FlashInfer CUTLASS
+```
 
-### Why B12X, not FlashInfer TRTLLM
+A runtime miss therefore does not repack the resident set. It updates only the
+slot(s) that are missing and publishes a 384-entry logical-to-physical map.
 
-DGX Spark is SM121 (CUDA capability family 12.x). B12X explicitly supports
-capability family 12.x. The current TRTLLM MXFP4 experts backend is gated to
-capability family 10.x, so it is not the execution path for this target.
+### Prefill and decode scheduling
 
-### Remaining blockers before a real single-Spark boot
+A wide prefill may route to more experts than fit in the resident arena.
+Experts are frequency-ranked for that prompt, partitioned into cache-sized
+groups and executed as exact partial routed sums. Every group computes only
+tokens that actually select one of its experts. The hottest cache-sized group
+runs last so it remains resident for the transition to decode.
 
-- Engram still defaults to roughly 200 GB of pinned host memory upstream. On
-  GB10 that is the same unified memory pool, so a disk-backed Engram reader is
-  required before the full model can fit.
-- The first creation of the expert store still consumes checkpoint tensors one
-  at a time through the ordinary weight iterator. Reusing a completed store
-  should later skip those payload reads entirely.
-- CUDA graphs are not a target for the synchronous pager. Dynamic residency
-  must first become correct in eager execution.
-- The B12X repack-on-miss path is a correctness baseline only.
+The next group's first bounded read batch is submitted while the current group
+runs. For ordinary single-group decode, a mixed hit/miss step similarly starts
+cold reads while the resident routed contribution is computed. All-hit and
+all-miss steps keep the simpler single-kernel path.
 
+Disk Engram uses the original FP8 rows and ue8m0 scales from safetensors.
+Hash-selected rows are submitted before decoder execution and consumed at the
+Engram layer, avoiding the upstream roughly 200 GB pinned-table residency.
 
-## Performance path update
+### Memory and I/O bounds
 
-The DGX Spark path now targets `flashinfer_cutlass`, not B12X. SM121 is
-accepted by vLLM's FlashInfer CUTLASS MXFP4/MXFP8 experts implementation, and
-that kernel consumes the converted expert tensors directly.
+A released V4.1 routed expert is roughly 19 MiB. At 64 slots across 40 routed
+layers the explicit expert cache is therefore on the order of 47 GiB before
+other model/runtime allocations. Look-ahead prefetch is capped by
+`VLLM_DSV41_NVME_EXPERT_READ_BATCH` (8 by default), rather than buffering an
+entire cache-sized group.
 
-The disk store is therefore a runtime-layout cache:
+The expert I/O workers are process-wide
+(`VLLM_DSV41_NVME_IO_WORKERS=32` by default), not one thread pool per layer.
+Buffered expert and Engram reads advise the kernel to drop consumed pages by
+default to avoid a duplicate page-cache working set on unified memory.
+
+## Runtime-layout store
 
 ```
 first build:
