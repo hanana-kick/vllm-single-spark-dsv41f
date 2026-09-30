@@ -83,6 +83,8 @@ class DiskExpertStore:
         self._open_lock = threading.Lock()
         self._using_direct_io = False
         self._direct_fields_disabled = False
+        self.direct_field_reads = 0
+        self.buffered_field_reads = 0
         self._wfd: int | None = None
         self._lock_file: TextIO | None = None
         self._written: set[int] = set()
@@ -414,6 +416,7 @@ class DiskExpertStore:
                             f"expert direct read size mismatch: "
                             f"{read_total}/{total}"
                         )
+                    self.direct_field_reads += 1
                     return read_total
                 except OSError as exc:
                     logger.warning_once(
@@ -437,6 +440,7 @@ class DiskExpertStore:
                 f"expert field read size mismatch: {read_total}/{total}"
             )
         self._drop_buffered_pages(file_offset, self.record_stride)
+        self.buffered_field_reads += 1
         return read_total
 
     def read_record_buffer(self, expert_id: int) -> bytearray:

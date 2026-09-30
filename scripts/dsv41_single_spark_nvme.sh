@@ -16,8 +16,9 @@ mkdir -p "${EXPERT_STORE_DIR}"
 
 export VLLM_DSV41_NVME_EXPERT_STORE_DIR="${EXPERT_STORE_DIR}"
 export VLLM_DSV41_NVME_EXPERT_CACHE_SLOTS="${EXPERT_CACHE_SLOTS}"
-# Buffered reads first. Enable O_DIRECT only after correctness is established.
-export VLLM_DSV41_NVME_DIRECT_IO="${VLLM_DSV41_NVME_DIRECT_IO:-0}"
+# Aligned GB10 UVA slots support direct NVMe reads. Unsupported filesystems
+# or alignment automatically fall back to buffered preadv.
+export VLLM_DSV41_NVME_DIRECT_IO="${VLLM_DSV41_NVME_DIRECT_IO:-1}"
 export VLLM_DSV41_NVME_EXPERT_READ_BATCH="${VLLM_DSV41_NVME_EXPERT_READ_BATCH:-8}"
 export VLLM_DSV41_NVME_IO_WORKERS="${VLLM_DSV41_NVME_IO_WORKERS:-32}"
 export VLLM_DSV41_NVME_DROP_PAGE_CACHE="${VLLM_DSV41_NVME_DROP_PAGE_CACHE:-1}"

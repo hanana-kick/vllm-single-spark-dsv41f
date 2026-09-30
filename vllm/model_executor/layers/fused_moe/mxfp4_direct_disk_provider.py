@@ -504,7 +504,8 @@ class FlashInferMxfp4DiskExpertProvider:
         logger.info(
             "DSV4.1 NVMe layer=%d calls=%d hit=%.1f%% "
             "reads=%d (%.2f GiB) read=%.2f GB/s slots=%d UVA=%s "
-            "prefetch_reads=%d hidden=%.1f%% wait=%.1fms",
+            "prefetch_reads=%d hidden=%.1f%% wait=%.1fms "
+            "direct=%d buffered=%d",
             self.layer_id,
             self.prepare_calls,
             hit_rate,
@@ -516,6 +517,8 @@ class FlashInferMxfp4DiskExpertProvider:
             self.prefetch_reads,
             hidden_pct,
             self.prefetch_wait_seconds * 1000.0,
+            self.store.direct_field_reads,
+            self.store.buffered_field_reads,
         )
 
     def split_resident(

@@ -20,7 +20,7 @@ export MODEL_DIR=/path/to/DeepSeek-V4.1-Flash
 export EXPERT_STORE_DIR=/fast-nvme/dsv41-expert-store
 
 # Conservative first pass: 64 runtime-layout expert slots per layer, text only,
-# one sequence, 8K context, eager mode, buffered disk I/O.
+# one sequence, 8K context, eager mode, direct I/O with buffered fallback.
 bash scripts/dsv41_single_spark_nvme.sh
 ```
 
@@ -167,3 +167,14 @@ Buffered expert and Engram reads default to
 `POSIX_FADV_DONTNEED` after consumption. On GB10 this avoids retaining a
 second Linux page-cache copy of weights that already have an explicit resident
 expert cache. Set either `*_DROP_PAGE_CACHE=0` only for A/B testing.
+
+## Direct I/O
+
+The performance launcher defaults `VLLM_DSV41_NVME_DIRECT_IO=1`. UVA expert
+slot backing is explicitly 4 KiB aligned, and the runtime checks every field
+offset/length before using O_DIRECT. If the filesystem or kernel rejects the
+request, only future UVA field-direct attempts are disabled; the serving path
+continues with buffered `preadv`.
+
+Pager stats report cumulative `direct=` and `buffered=` expert field reads,
+so the active path is visible without a profiler.
