@@ -150,6 +150,9 @@ class FlashInferMxfp4DiskExpertProvider:
         self.cache_hits = 0
         self.cache_misses = 0
         self.read_seconds = 0.0
+        self.prefetch_service_seconds = 0.0
+        self.prefetch_wait_seconds = 0.0
+        self.prefetch_reads = 0
         self.prepare_calls = 0
         self.stats_every = int(
             os.environ.get("VLLM_DSV41_NVME_STATS_EVERY", "0")
@@ -425,15 +428,21 @@ class FlashInferMxfp4DiskExpertProvider:
                     "the prefetched group was activated"
                 )
 
+            wait_started = time.perf_counter()
             completed = [
                 (load, *future.result())
                 for load, future in prefetched.futures
             ]
+            host_wait = time.perf_counter() - wait_started
             # Reads in one prefetched group overlap in the shared executor.
-            # The slowest individual read is a closer approximation of the
-            # group's storage-service time than either the sum or host wait.
+            # The slowest individual read approximates storage-service time;
+            # host_wait is only the tail that current GPU work failed to hide.
             if completed:
-                self.read_seconds += max(seconds for _, _, seconds in completed)
+                service = max(seconds for _, _, seconds in completed)
+                self.read_seconds += service
+                self.prefetch_service_seconds += service
+                self.prefetch_wait_seconds += host_wait
+                self.prefetch_reads += len(completed)
             records = [(load, buffer) for load, buffer, _ in completed]
 
             try:
@@ -485,9 +494,17 @@ class FlashInferMxfp4DiskExpertProvider:
             if self.read_seconds > 0
             else 0.0
         )
+        hidden_pct = 0.0
+        if self.prefetch_service_seconds > 0:
+            hidden_pct = 100.0 * max(
+                0.0,
+                1.0
+                - self.prefetch_wait_seconds / self.prefetch_service_seconds,
+            )
         logger.info(
             "DSV4.1 NVMe layer=%d calls=%d hit=%.1f%% "
-            "reads=%d (%.2f GiB) read=%.2f GB/s slots=%d UVA=%s",
+            "reads=%d (%.2f GiB) read=%.2f GB/s slots=%d UVA=%s "
+            "prefetch_reads=%d hidden=%.1f%% wait=%.1fms",
             self.layer_id,
             self.prepare_calls,
             hit_rate,
@@ -496,6 +513,9 @@ class FlashInferMxfp4DiskExpertProvider:
             read_gbps,
             self.capacity,
             self.uses_uva,
+            self.prefetch_reads,
+            hidden_pct,
+            self.prefetch_wait_seconds * 1000.0,
         )
 
     def split_resident(
