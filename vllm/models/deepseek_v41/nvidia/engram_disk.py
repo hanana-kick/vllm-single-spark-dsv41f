@@ -22,6 +22,15 @@ _ENGRAM_STAGE_POOL = ThreadPoolExecutor(
     ),
     thread_name_prefix="vllm-engram-stage",
 )
+# All Engram tables share one NVMe queue. The model submits every layer before
+# decoder execution, so per-table pools would multiply thread count (e.g. two
+# 32-worker pools) without increasing the device's useful queue depth.
+_ENGRAM_IO_POOL = ThreadPoolExecutor(
+    max_workers=max(
+        1, int(os.environ.get("VLLM_DSV41_ENGRAM_IO_WORKERS", "32"))
+    ),
+    thread_name_prefix="vllm-engram-io",
+)
 
 
 def _tensor_location(
@@ -146,9 +155,10 @@ class DiskEngramTable:
         self.num_rows = num_rows
         self.w_base = w_base + row_start * dim
         self.s_base = s_base + row_start * scale_cols
-        self._pool = ThreadPoolExecutor(
-            max_workers=max(1, threads), thread_name_prefix="vllm-engram-disk"
-        )
+        # Kept for API/backward compatibility; the process-wide I/O
+        # pool controls actual queue depth across all Engram layers.
+        self.threads = max(1, threads)
+        self._pool = _ENGRAM_IO_POOL
 
     @staticmethod
     def _pread_exact(fd: int, offset: int, size: int) -> bytes:
@@ -298,10 +308,8 @@ class DiskEngramTable:
         return out
 
     def close(self) -> None:
-        pool = getattr(self, "_pool", None)
-        if pool is not None:
-            pool.shutdown(wait=True)
-            self._pool = None
+        # The process-wide pools outlive individual tables. Only this table's
+        # file descriptors are owned here.
         for name in ("w_fd", "s_fd"):
             fd = getattr(self, name, None)
             if fd is not None:
