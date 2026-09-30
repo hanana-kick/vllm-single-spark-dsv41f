@@ -215,6 +215,12 @@ class FlashInferMxfp4DiskExpertProvider:
             tuple(cold[i : i + self.capacity])
             for i in range(0, len(cold), self.capacity)
         ]
+        # The first partition is the only one that also computes shared
+        # experts, so Mxfp4MoEMethod must run it over the full token matrix.
+        # Execute the hottest cold partition first to maximize useful routed
+        # work in that unavoidable full-token pass. Keep the actual hot set
+        # last so it remains resident when prefill hands off to decode.
+        groups.reverse()
         groups.append(tuple(hot))
         return tuple(groups)
 

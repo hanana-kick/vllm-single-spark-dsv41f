@@ -1264,27 +1264,58 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             group_topk_weights = torch.where(
                 active, topk_weights, torch.zeros_like(topk_weights)
             )
+
+            if group_index == 0:
+                # Run the first pass over every token because this is also the
+                # one pass that owns the shared-expert computation.
+                run_x = x
+                run_ids = group_topk_ids
+                run_weights = group_topk_weights
+                run_shared = shared_experts
+                run_shared_input = shared_experts_input
+                token_rows = None
+            else:
+                # Subsequent passes contain routed experts only. Do not send a
+                # token through FlashInfer if none of its top-k routes belong
+                # to this expert group. Wide prefills otherwise repeat the
+                # entire token matrix once per cache-sized expert partition.
+                token_mask = active.any(dim=-1)
+                token_rows = torch.nonzero(token_mask, as_tuple=False).squeeze(-1)
+                if token_rows.numel() == 0:
+                    continue
+                run_x = x.index_select(0, token_rows)
+                run_ids = group_topk_ids.index_select(0, token_rows)
+                run_weights = group_topk_weights.index_select(0, token_rows)
+                run_shared = None
+                run_shared_input = None
+
             partial = self.moe_kernel.apply(
-                hidden_states=x,
+                hidden_states=run_x,
                 w1=prepared.w1,
                 w2=prepared.w2,
-                topk_weights=group_topk_weights,
-                topk_ids=group_topk_ids,
+                topk_weights=run_weights,
+                topk_ids=run_ids,
                 activation=layer.activation,
                 global_num_experts=layer.global_num_experts,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 expert_map=prepared.expert_map,
-                shared_experts=shared_experts if group_index == 0 else None,
-                shared_experts_input=(
-                    shared_experts_input if group_index == 0 else None
-                ),
+                shared_experts=run_shared,
+                shared_experts_input=run_shared_input,
             )
             provider.mark_compute_submitted()
             if isinstance(partial, UnfinalizedMoEOutput):
                 raise RuntimeError(
                     "partitioned NVMe prefill does not support deferred MoE finalize"
                 )
-            result = partial if result is None else result + partial
+
+            if result is None:
+                result = partial
+            elif token_rows is None:
+                result = result + partial
+            else:
+                # index_add is exact here: each partial is already the sum of
+                # this group's active top-k contributions for one token.
+                result.index_add_(0, token_rows, partial)
 
         assert result is not None
         return result
