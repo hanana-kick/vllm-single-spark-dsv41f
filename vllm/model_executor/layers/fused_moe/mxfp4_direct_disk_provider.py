@@ -40,6 +40,7 @@ class _PrefetchedExpertGroup:
     required: tuple[ExpertPageKey, ...]
     plan: ExpertSlotPlan
     futures: list[tuple[ExpertLoad, Future[tuple[bytearray, float]]]]
+    deferred_loads: tuple[ExpertLoad, ...]
 
 
 class FlashInferMxfp4DiskExpertProvider:
@@ -395,6 +396,11 @@ class FlashInferMxfp4DiskExpertProvider:
             self.cache_hits += sum(1 for key in required if key in before)
             self.cache_misses += len(plan.loads)
             loads = sorted(plan.loads, key=lambda load: load.key.expert_id)
+            # Bound look-ahead memory. A V4.1 MXFP4 expert is large; retaining
+            # one bytearray per miss for a full 64-slot group can exceed a GiB.
+            # Only the first read_batch records overlap current compute.
+            ahead = loads[: self.read_batch]
+            deferred = tuple(loads[self.read_batch :])
             futures = [
                 (
                     load,
@@ -402,9 +408,11 @@ class FlashInferMxfp4DiskExpertProvider:
                         self._read_record_buffer_timed, load.key.expert_id
                     ),
                 )
-                for load in loads
+                for load in ahead
             ]
-            return _PrefetchedExpertGroup(required, plan, futures)
+            return _PrefetchedExpertGroup(
+                required, plan, futures, deferred
+            )
 
     def activate_prefetch(
         self, prefetched: _PrefetchedExpertGroup
@@ -429,14 +437,21 @@ class FlashInferMxfp4DiskExpertProvider:
             records = [(load, buffer) for load, buffer, _ in completed]
 
             try:
-                if self.uses_uva and records:
+                if self.uses_uva and (records or prefetched.deferred_loads):
                     self._wait_compute_before_uva_write()
                 for load, buffer in records:
                     self._copy_buffer_to_slot(buffer, load.slot)
+                self.disk_reads += len(records)
+
+                # Remaining misses use the normal bounded loader after current
+                # compute has finished. This preserves the overlap benefit of
+                # the first batch without unbounded temporary record storage.
+                if prefetched.deferred_loads:
+                    self._load_records(list(prefetched.deferred_loads))
+
                 if records and not self.uses_uva:
                     self._copy_done = torch.cuda.Event()
                     self._copy_done.record(torch.cuda.current_stream())
-                self.disk_reads += len(records)
                 self.cache.commit(prefetched.plan)
             except Exception:
                 self.cache.reset()
