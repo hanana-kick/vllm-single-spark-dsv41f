@@ -82,6 +82,7 @@ class DiskExpertStore:
         self._buffered_fd: int | None = None
         self._open_lock = threading.Lock()
         self._using_direct_io = False
+        self._direct_fields_disabled = False
         self._wfd: int | None = None
         self._lock_file: TextIO | None = None
         self._written: set[int] = set()
@@ -348,7 +349,9 @@ class DiskExpertStore:
 
         views: list[memoryview] = []
         total = 0
-        direct_compatible = self.direct_io
+        direct_compatible = (
+            self.direct_io and not self._direct_fields_disabled
+        )
         for field in self.fields.values():
             dst = destinations[field.name]
             if dst.device.type != "cpu" or not dst.is_contiguous():
@@ -419,13 +422,13 @@ class DiskExpertStore:
                         self.path,
                         exc,
                     )
+                    # Multiple expert reads may share the positional
+                    # direct fd concurrently. Do not close it from one failing
+                    # worker: another worker can be inside preadv. Disable only
+                    # future UVA field-direct attempts and retry this read
+                    # through the independent buffered fd.
                     with self._open_lock:
-                        if self._fd is not None:
-                            os.close(self._fd)
-                            self._fd = None
-                        self._using_direct_io = False
-                        # Do not retry O_DIRECT on every expert miss.
-                        self.direct_io = False
+                        self._direct_fields_disabled = True
 
         fd = self._open_buffered_reader()
         read_total = preadv_all(fd)
