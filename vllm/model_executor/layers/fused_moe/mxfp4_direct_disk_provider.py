@@ -380,10 +380,7 @@ class FlashInferMxfp4DiskExpertProvider:
         """Fence only the physical slots consumed by this MoE launch."""
         if not self.uses_uva or not required:
             return
-        mapping = self.cache.snapshot()
-        slots = frozenset(
-            mapping[key] for key in required if key in mapping
-        )
+        slots = self.cache.slots_for(required)
         if not slots:
             return
         # Reap completed launches opportunistically.
@@ -523,9 +520,8 @@ class FlashInferMxfp4DiskExpertProvider:
                 f"is {self.capacity}"
             )
         with self._lock:
-            before = self.cache.snapshot()
             plan = self.cache.plan(required)
-            self.cache_hits += sum(1 for key in required if key in before)
+            self.cache_hits += len(required) - len(plan.loads)
             self.cache_misses += len(plan.loads)
             loads = sorted(plan.loads, key=lambda load: load.key.expert_id)
             # Bound look-ahead memory. A V4.1 MXFP4 expert is large; retaining
@@ -681,10 +677,7 @@ class FlashInferMxfp4DiskExpertProvider:
         self, required: tuple[ExpertPageKey, ...]
     ) -> tuple[tuple[ExpertPageKey, ...], tuple[ExpertPageKey, ...]]:
         """Split required experts without changing LRU state."""
-        resident_map = self.cache.snapshot()
-        resident = tuple(key for key in required if key in resident_map)
-        missing = tuple(key for key in required if key not in resident_map)
-        return resident, missing
+        return self.cache.partition_residency(required)
 
     def current_weights(self) -> ExpertWeightResult:
         """Return the currently published slots without changing residency."""
@@ -704,9 +697,8 @@ class FlashInferMxfp4DiskExpertProvider:
             )
 
         with self._lock:
-            before = self.cache.snapshot()
             plan = self.cache.plan(required)
-            self.cache_hits += sum(1 for key in required if key in before)
+            self.cache_hits += len(required) - len(plan.loads)
             self.cache_misses += len(plan.loads)
 
             try:

@@ -252,6 +252,28 @@ class LRUExpertSlotCache:
         with self._lock:
             return dict(self._mapping)
 
+    def partition_residency(
+        self, required: Iterable[ExpertPageKey]
+    ) -> tuple[tuple[ExpertPageKey, ...], tuple[ExpertPageKey, ...]]:
+        """Split keys into resident/missing without copying the full mapping."""
+        with self._lock:
+            resident: list[ExpertPageKey] = []
+            missing: list[ExpertPageKey] = []
+            for key in required:
+                (resident if key in self._mapping else missing).append(key)
+            return tuple(resident), tuple(missing)
+
+    def slots_for(
+        self, required: Iterable[ExpertPageKey]
+    ) -> frozenset[int]:
+        """Return physical slots for currently resident keys."""
+        with self._lock:
+            return frozenset(
+                self._mapping[key]
+                for key in required
+                if key in self._mapping
+            )
+
     def reset(self) -> None:
         """Forget all residency after a failed physical slot update."""
         with self._lock:
