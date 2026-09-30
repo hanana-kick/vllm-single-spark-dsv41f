@@ -1253,8 +1253,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Normal all-hit/all-miss cases stay on the single-kernel path.
             # Mixed residency can overlap missing NVMe reads with useful routed
             # compute, but only when shared experts are externally scheduled.
+            split_miss_min_tokens = int(
+                os.environ.get(
+                    "VLLM_DSV41_NVME_SPLIT_MISS_MIN_TOKENS", "64"
+                )
+            )
             split_miss = (
-                bool(resident)
+                x.shape[0] >= split_miss_min_tokens
+                and bool(resident)
                 and bool(missing)
                 and not (
                     shared_experts is not None
