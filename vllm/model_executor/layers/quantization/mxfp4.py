@@ -1282,7 +1282,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     shared_experts=shared_experts,
                     shared_experts_input=shared_experts_input,
                 )
-                provider.mark_compute_submitted()
+                provider.mark_compute_submitted(required)
                 return output
 
             # Start all missing reads before computing the already-resident
@@ -1343,7 +1343,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "NVMe split-miss path does not support deferred MoE finalize"
                     )
                 result.index_add_(0, resident_rows, hit_partial)
-                provider.mark_compute_submitted()
+                provider.mark_compute_submitted(resident)
 
             # At this point NVMe reads have run in parallel with the hit-side
             # kernel. Publishing waits only if the GPU is still consuming an
@@ -1394,7 +1394,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "NVMe split-miss path does not support deferred MoE finalize"
                     )
                 result.index_add_(0, missing_rows, miss_partial)
-                provider.mark_compute_submitted()
+                provider.mark_compute_submitted(missing)
 
             return result
 
@@ -1481,7 +1481,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 shared_experts=None,
                 shared_experts_input=None,
             )
-            provider.mark_compute_submitted()
+            provider.mark_compute_submitted(group)
             prefetched = next_prefetch
             if isinstance(partial, UnfinalizedMoEOutput):
                 raise RuntimeError(

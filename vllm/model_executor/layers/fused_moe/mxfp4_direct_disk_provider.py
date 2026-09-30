@@ -36,6 +36,12 @@ _NVME_IO_POOL = ThreadPoolExecutor(
 
 
 @dataclass
+class _InFlightSlotUse:
+    event: torch.cuda.Event
+    slots: frozenset[int]
+
+
+@dataclass
 class _PrefetchedExpertGroup:
     required: tuple[ExpertPageKey, ...]
     plan: ExpertSlotPlan
@@ -143,7 +149,7 @@ class FlashInferMxfp4DiskExpertProvider:
                 self._staging_owners.append(owner)
                 self._staging.append(view)
         self._copy_done: torch.cuda.Event | None = None
-        self._compute_done: torch.cuda.Event | None = None
+        self._inflight_slot_uses: list[_InFlightSlotUse] = []
         self._pool = _NVME_IO_POOL
         self._lock = threading.RLock()
         self.disk_reads = 0
@@ -270,24 +276,49 @@ class FlashInferMxfp4DiskExpertProvider:
             self.store.field_view(record, "w2_scale"), non_blocking=True
         )
 
-    def _wait_compute_before_uva_write(self) -> None:
-        if self.uses_uva and self._compute_done is not None:
-            # CPU preadv is not ordered by a CUDA stream. Never overwrite a
-            # mapped slot until the previous kernel using it has completed.
-            self._compute_done.synchronize()
-            self._compute_done = None
-
-    def mark_compute_submitted(self) -> None:
-        """Fence slot reuse after a kernel that consumed the current mapping."""
-        if not self.uses_uva:
+    def _wait_compute_before_uva_write(
+        self, target_slots: set[int] | frozenset[int]
+    ) -> None:
+        if not self.uses_uva or not self._inflight_slot_uses:
             return
+
+        remaining: list[_InFlightSlotUse] = []
+        for use in self._inflight_slot_uses:
+            if use.event.query():
+                continue
+            if use.slots.isdisjoint(target_slots):
+                remaining.append(use)
+                continue
+            # CPU preadv is not CUDA-stream ordered. Wait only when the slot
+            # about to be overwritten is still consumed by an in-flight MoE.
+            use.event.synchronize()
+        self._inflight_slot_uses = remaining
+
+    def mark_compute_submitted(
+        self, required: tuple[ExpertPageKey, ...]
+    ) -> None:
+        """Fence only the physical slots consumed by this MoE launch."""
+        if not self.uses_uva or not required:
+            return
+        mapping = self.cache.snapshot()
+        slots = frozenset(
+            mapping[key] for key in required if key in mapping
+        )
+        if not slots:
+            return
+        # Reap completed launches opportunistically.
+        self._inflight_slot_uses = [
+            use for use in self._inflight_slot_uses if not use.event.query()
+        ]
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
-        self._compute_done = event
+        self._inflight_slot_uses.append(_InFlightSlotUse(event, slots))
 
     def _load_records_uva(self, loads) -> None:
         assert self.cpu_backing is not None
-        self._wait_compute_before_uva_write()
+        self._wait_compute_before_uva_write(
+            {int(load.slot) for load in loads}
+        )
 
         def read_one(load) -> int:
             slot = load.slot
@@ -452,7 +483,16 @@ class FlashInferMxfp4DiskExpertProvider:
 
             try:
                 if self.uses_uva and (records or prefetched.deferred_loads):
-                    self._wait_compute_before_uva_write()
+                    self._wait_compute_before_uva_write(
+                        {
+                            int(load.slot)
+                            for load, *_ in records
+                        }
+                        | {
+                            int(load.slot)
+                            for load in prefetched.deferred_loads
+                        }
+                    )
                 for load, buffer in records:
                     self._copy_buffer_to_slot(buffer, load.slot)
                 self.disk_reads += len(records)
@@ -589,7 +629,10 @@ class FlashInferMxfp4DiskExpertProvider:
 
     def close(self) -> None:
         self._wait_staging_reuse()
-        self._wait_compute_before_uva_write()
+        if self.uses_uva:
+            for use in self._inflight_slot_uses:
+                use.event.synchronize()
+            self._inflight_slot_uses.clear()
         # Shared process-wide I/O pool remains alive for other MoE layers.
 
     def __del__(self) -> None:
