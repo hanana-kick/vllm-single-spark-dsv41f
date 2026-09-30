@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import weakref
+from concurrent.futures import Future
 from contextlib import ExitStack
 
 import numpy as np
@@ -291,6 +292,8 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         self.use_thp = use_thp
         self._packed: torch.Tensor | None = None
         self._disk = None
+        self._disk_future: Future[torch.Tensor] | None = None
+        self._disk_future_tokens = 0
         if self.disk_mode:
             # Base __init__ attaches this loader to the tiny placeholder
             # Parameters; it intentionally does not copy the 200 GB tables.
@@ -445,11 +448,11 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         assert self._views is not None
         return self._views
 
-    def lookup(
-        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
-    ) -> None:
+    def start_disk_lookup(self, indices: torch.Tensor) -> None:
         if not self.disk_mode:
-            return super().lookup(indices, out, background=background)
+            raise RuntimeError("start_disk_lookup requires disk-backed Engram")
+        if self._disk_future is not None:
+            raise RuntimeError("previous Engram disk lookup has not been consumed")
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "disk-backed Engram performs host I/O and requires eager "
@@ -459,9 +462,9 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         num_tokens = indices.shape[0]
         local_heads = self.part_n_hash_cols
         head_end = min(self.head_start + local_heads, self.n_hash_cols)
-        ids = indices[:, self.head_start:head_end].detach().to(
-            device="cpu", dtype=torch.int64
-        )
+        ids = indices[:, self.head_start:head_end].detach()
+        if ids.device.type != "cpu" or ids.dtype != torch.int64:
+            ids = ids.to(device="cpu", dtype=torch.int64)
         if ids.shape[1] < local_heads:
             pad = torch.full(
                 (num_tokens, local_heads - ids.shape[1]),
@@ -474,10 +477,27 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         local = torch.where(
             owned, flat - self.vocab_start_idx, torch.zeros_like(flat)
         )
-        rows = self._disk.read_rows(local, owned).reshape(
-            num_tokens, local_heads, self.dim
+        self._disk_future = self._disk.submit_rows(local, owned)
+        self._disk_future_tokens = num_tokens
+
+    def finish_disk_lookup(self, out: torch.Tensor) -> None:
+        future = self._disk_future
+        if future is None:
+            raise RuntimeError("no pending Engram disk lookup")
+        rows = future.result().reshape(
+            self._disk_future_tokens, self.part_n_hash_cols, self.dim
         )
-        out.copy_(rows.to(device=out.device), non_blocking=False)
+        out[: self._disk_future_tokens].copy_(rows, non_blocking=True)
+        self._disk_future = None
+        self._disk_future_tokens = 0
+
+    def lookup(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> None:
+        if not self.disk_mode:
+            return super().lookup(indices, out, background=background)
+        self.start_disk_lookup(indices)
+        self.finish_disk_lookup(out)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.dp_size == 1:
@@ -563,6 +583,9 @@ class Engram(BaseEngram):
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Prefetch local shared rows or the DP group's gathered hash IDs."""
+        if self.embed_tokens.disk_mode:
+            self.embed_tokens.start_disk_lookup(hash_ids)
+            return
         if self._prefetch_stream is None:
             return super().prepare_embeddings(hash_ids)
         rows = self.staged_rows[: hash_ids.shape[0]]
@@ -588,6 +611,10 @@ class Engram(BaseEngram):
         torch.cuda.current_stream().wait_event(event)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        if self.embed_tokens.disk_mode:
+            rows = self.staged_rows[:num_tokens]
+            self.embed_tokens.finish_disk_lookup(rows)
+            return rows
         if self._prefetch_done is not None:
             self._finish_prefetch(self._prefetch_done)
         if self.embed_tokens.dp_size > 1:

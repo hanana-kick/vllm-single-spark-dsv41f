@@ -887,12 +887,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 gathered_hashes = gather_engram_hashes(
                     engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
                 )
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
+                engrams = [
+                    engram
+                    for layer in islice(
+                        self.layers, self.start_layer, self.end_layer
+                    )
+                    if (engram := getattr(layer, "engram", None)) is not None
+                ]
+                # Disk-backed Engram needs host row ids. Copy the complete
+                # hash tensor once, then launch every table read before decoder
+                # execution instead of synchronizing GPU->CPU once per layer.
+                disk_hashes = None
+                if any(engram.embed_tokens.disk_mode for engram in engrams):
+                    disk_hashes = gathered_hashes.detach().to(
+                        device="cpu", dtype=torch.int64
+                    )
+                for engram in engrams:
+                    source = (
+                        disk_hashes
+                        if engram.embed_tokens.disk_mode
+                        else gathered_hashes
+                    )
+                    assert source is not None
+                    engram.prepare_embeddings(
+                        source[:, engram.layer_hash_index]
+                    )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:

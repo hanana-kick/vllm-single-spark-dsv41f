@@ -7,12 +7,18 @@ from __future__ import annotations
 import json
 import os
 import struct
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 
 _HEADER_LEN = struct.Struct("<Q")
+_ENGRAM_STAGE_POOL = ThreadPoolExecutor(
+    max_workers=max(
+        1, int(os.environ.get("VLLM_DSV41_ENGRAM_STAGE_WORKERS", "4"))
+    ),
+    thread_name_prefix="vllm-engram-stage",
+)
 
 
 def _tensor_location(
@@ -192,6 +198,12 @@ class DiskEngramTable:
                 result[row] = block[lo : lo + row_bytes]
         return result
 
+    def submit_rows(
+        self, local_rows: torch.Tensor, owned: torch.Tensor
+    ) -> Future[torch.Tensor]:
+        """Submit a row gather so decoder compute can overlap the disk I/O."""
+        return _ENGRAM_STAGE_POOL.submit(self.read_rows, local_rows, owned)
+
     def read_rows(
         self, local_rows: torch.Tensor, owned: torch.Tensor
     ) -> torch.Tensor:
@@ -207,7 +219,9 @@ class DiskEngramTable:
             raise ValueError("local_rows and owned must have equal length")
         count = local_rows.numel()
         if count == 0:
-            return torch.empty((0, self.dim), dtype=torch.bfloat16)
+            return torch.empty(
+                (0, self.dim), dtype=torch.bfloat16, pin_memory=True
+            )
 
         valid_rows = local_rows[owned]
         if valid_rows.numel() and (
@@ -254,7 +268,9 @@ class DiskEngramTable:
             inverse = torch.empty((0,), dtype=torch.int64)
             dequant = torch.empty((0, self.dim), dtype=torch.float32)
 
-        out = torch.zeros((count, self.dim), dtype=torch.bfloat16)
+        out = torch.zeros(
+            (count, self.dim), dtype=torch.bfloat16, pin_memory=True
+        )
         if valid_rows.numel():
             out[owned] = dequant[inverse].to(torch.bfloat16)
         return out
