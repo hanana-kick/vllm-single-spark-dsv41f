@@ -335,8 +335,9 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         self._disk_gpu_dequant = (
             os.environ.get("VLLM_DSV41_ENGRAM_GPU_DEQUANT", "1") != "0"
         )
-        self._disk_raw_hold: tuple[torch.Tensor, ...] | None = None
-        self._disk_dequant_done: torch.cuda.Event | None = None
+        self._disk_raw_inflight: list[
+            tuple[torch.cuda.Event, tuple[torch.Tensor, ...]]
+        ] = []
         if self.disk_mode:
             # Base __init__ attaches this loader to the tiny placeholder
             # Parameters; it intentionally does not copy the 200 GB tables.
@@ -496,13 +497,19 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             raise RuntimeError("start_disk_lookup requires disk-backed Engram")
         if self._disk_future is not None:
             raise RuntimeError("previous Engram disk lookup has not been consumed")
-        if self._disk_raw_hold is not None:
-            # Raw pinned rows must outlive the CUDA UVA dequant kernel. By the
-            # next model step this event is normally already complete.
-            assert self._disk_dequant_done is not None
-            self._disk_dequant_done.synchronize()
-            self._disk_raw_hold = None
-            self._disk_dequant_done = None
+        if self._disk_raw_inflight:
+            # Raw pinned buffers need only outlive their UVA dequant kernel.
+            # Reap completed launches without a host synchronization.
+            self._disk_raw_inflight = [
+                item
+                for item in self._disk_raw_inflight
+                if not item[0].query()
+            ]
+            # Bound pathological producer-ahead cases without forcing a sync
+            # in the normal one-step pipeline.
+            if len(self._disk_raw_inflight) > 4:
+                event, _ = self._disk_raw_inflight.pop(0)
+                event.synchronize()
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "disk-backed Engram performs host I/O and requires eager "
@@ -563,13 +570,17 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                 )
             done = torch.cuda.Event()
             done.record(torch.cuda.current_stream())
-            self._disk_dequant_done = done
             # Retain both owners and CUDA views until the event completes.
-            self._disk_raw_hold = (
-                raw_weight,
-                raw_scales,
-                weight_uva,
-                scales_uva,
+            self._disk_raw_inflight.append(
+                (
+                    done,
+                    (
+                        raw_weight,
+                        raw_scales,
+                        weight_uva,
+                        scales_uva,
+                    ),
+                )
             )
         else:
             rows = future.result().reshape(
