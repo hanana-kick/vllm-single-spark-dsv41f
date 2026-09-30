@@ -1246,9 +1246,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return output
 
         # Wide prefill can touch more unique experts than the resident cache.
-        # Execute exact partial sums in cache-sized expert groups instead of
-        # thrashing the LRU one token at a time.
-        result = None
+        # On the TP1 paging path shared experts are orchestrated by MoERunner
+        # outside this routed kernel (NO_OVERLAP or aux-stream overlap), so
+        # every routed partition can execute only tokens that actually select
+        # one of its resident experts.
+        if (
+            shared_experts is not None
+            and self.moe_kernel.can_overlap_shared_experts
+        ):
+            raise RuntimeError(
+                "partitioned NVMe prefill requires externally scheduled shared "
+                "experts; internal shared-expert overlap is not supported"
+            )
+
+        result = torch.zeros_like(x)
         topk_ids_long = topk_ids.to(dtype=torch.long)
         valid_route = topk_ids_long >= 0
         safe_topk_ids = topk_ids_long.clamp_min(0)
@@ -1269,6 +1280,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if group_index + 1 < len(groups)
                 else None
             )
+
             group_membership.zero_()
             group_ids = torch.tensor(
                 [key.expert_id for key in group],
@@ -1277,6 +1289,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             group_membership[group_ids] = True
             active = valid_route & group_membership[safe_topk_ids]
+            token_rows = torch.nonzero(
+                active.any(dim=-1), as_tuple=False
+            ).squeeze(-1)
+
+            if token_rows.numel() == 0:
+                prefetched = next_prefetch
+                continue
+
             fallback = group[0].expert_id
             group_topk_ids = torch.where(
                 active, topk_ids, torch.full_like(topk_ids, fallback)
@@ -1284,30 +1304,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             group_topk_weights = torch.where(
                 active, topk_weights, torch.zeros_like(topk_weights)
             )
-
-            if group_index == 0:
-                # Run the first pass over every token because this is also the
-                # one pass that owns the shared-expert computation.
-                run_x = x
-                run_ids = group_topk_ids
-                run_weights = group_topk_weights
-                run_shared = shared_experts
-                run_shared_input = shared_experts_input
-                token_rows = None
-            else:
-                # Subsequent passes contain routed experts only. Do not send a
-                # token through FlashInfer if none of its top-k routes belong
-                # to this expert group. Wide prefills otherwise repeat the
-                # entire token matrix once per cache-sized expert partition.
-                token_mask = active.any(dim=-1)
-                token_rows = torch.nonzero(token_mask, as_tuple=False).squeeze(-1)
-                if token_rows.numel() == 0:
-                    continue
-                run_x = x.index_select(0, token_rows)
-                run_ids = group_topk_ids.index_select(0, token_rows)
-                run_weights = group_topk_weights.index_select(0, token_rows)
-                run_shared = None
-                run_shared_input = None
+            run_x = x.index_select(0, token_rows)
+            run_ids = group_topk_ids.index_select(0, token_rows)
+            run_weights = group_topk_weights.index_select(0, token_rows)
 
             partial = self.moe_kernel.apply(
                 hidden_states=run_x,
@@ -1319,8 +1318,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 global_num_experts=layer.global_num_experts,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 expert_map=prepared.expert_map,
-                shared_experts=run_shared,
-                shared_experts_input=run_shared_input,
+                # Shared experts were already scheduled by MoERunner. Passing
+                # them here would couple shared compute to one routed partition.
+                shared_experts=None,
+                shared_experts_input=None,
             )
             provider.mark_compute_submitted()
             prefetched = next_prefetch
@@ -1328,17 +1329,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 raise RuntimeError(
                     "partitioned NVMe prefill does not support deferred MoE finalize"
                 )
+            result.index_add_(0, token_rows, partial)
 
-            if result is None:
-                result = partial
-            elif token_rows is None:
-                result = result + partial
-            else:
-                # index_add is exact here: each partial is already the sum of
-                # this group's active top-k contributions for one token.
-                result.index_add_(0, token_rows, partial)
-
-        assert result is not None
         return result
 
     def apply_monolithic(
