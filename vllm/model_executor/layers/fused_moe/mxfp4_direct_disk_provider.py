@@ -193,13 +193,20 @@ class FlashInferMxfp4DiskExpertProvider:
                     seen.add(expert_id)
                     unique_ids.append(expert_id)
         else:
-            valid = flat[flat >= 0]
+            valid = flat[flat >= 0].to(dtype=torch.long)
             if valid.numel() == 0:
                 return ()
-            unique = torch.unique(valid, sorted=False)
-            if int(unique.max()) >= self.global_num_experts:
+            if int(valid.max()) >= self.global_num_experts:
                 raise ValueError("routed expert id is out of range")
-            unique_ids = [int(value) for value in unique.to("cpu").tolist()]
+            counts = torch.bincount(
+                valid, minlength=self.global_num_experts
+            )
+            counts_cpu = counts.to("cpu").tolist()
+            unique_ids = [
+                expert_id
+                for expert_id, count in enumerate(counts_cpu)
+                if count
+            ]
 
         return tuple(
             ExpertPageKey(self.layer_id, expert_id) for expert_id in unique_ids
@@ -226,18 +233,24 @@ class FlashInferMxfp4DiskExpertProvider:
         if valid.numel() == 0:
             return ((),)
 
-        # Count on the accelerator, then transfer only <=384 expert IDs and
-        # counts to the host. This avoids a large GPU->CPU synchronization on
-        # every prefill layer.
-        unique, counts_tensor = torch.unique(
-            valid, sorted=False, return_counts=True
-        )
-        if int(unique.max()) >= self.global_num_experts:
+        # Expert IDs are bounded to [0, 384), so a fixed-size histogram is
+        # cheaper and more predictable than sorting/uniquing a large route
+        # matrix. Only 384 counts cross to the host.
+        valid = valid.to(dtype=torch.long)
+        if int(valid.max()) >= self.global_num_experts:
             raise ValueError("routed expert id is out of range")
-        ids_cpu = [int(value) for value in unique.to("cpu").tolist()]
-        counts_cpu = [int(value) for value in counts_tensor.to("cpu").tolist()]
-        counts = dict(zip(ids_cpu, counts_cpu, strict=True))
-        ordered_ids = sorted(counts, key=lambda expert: (counts[expert], expert))
+        counts_tensor = torch.bincount(
+            valid, minlength=self.global_num_experts
+        )
+        counts_cpu = counts_tensor.to("cpu").tolist()
+        counts = {
+            expert_id: int(count)
+            for expert_id, count in enumerate(counts_cpu)
+            if count
+        }
+        ordered_ids = sorted(
+            counts, key=lambda expert: (counts[expert], expert)
+        )
         required = tuple(
             ExpertPageKey(self.layer_id, expert_id) for expert_id in ordered_ids
         )
