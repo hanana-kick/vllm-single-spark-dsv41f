@@ -95,6 +95,16 @@ class FlashInferMxfp4DiskExpertProvider:
             dtype=torch.int32,
             device=w13.device,
         )
+        # 384 int32 entries are only 1.5 KiB. Keep residency metadata on the
+        # host and upload it in one copy only when the cache mapping changes.
+        # Cache-hit decode therefore performs no tiny per-expert CUDA writes.
+        self._expert_map_cpu = torch.full(
+            (global_num_experts,),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
         self.read_batch = max(1, int(read_batch))
         self._staging_owners: list[torch.Tensor] = []
         self._staging: list[torch.Tensor] = []
@@ -368,19 +378,22 @@ class FlashInferMxfp4DiskExpertProvider:
             self.cache_hits += sum(1 for key in required if key in before)
             self.cache_misses += len(plan.loads)
 
-            for eviction in plan.evictions:
-                self.expert_map[eviction.key.expert_id] = -1
-
             try:
                 self._load_records(list(plan.loads))
                 self.cache.commit(plan)
             except Exception:
                 self.cache.reset()
+                self._expert_map_cpu.fill_(-1)
                 self.expert_map.fill_(-1)
                 raise
 
-            for key, slot in self.cache.snapshot().items():
-                self.expert_map[key.expert_id] = slot
+            if plan.loads or plan.evictions:
+                # Rebuild a tiny host shadow and publish it with one async copy
+                # instead of launching one CUDA assignment per expert.
+                self._expert_map_cpu.fill_(-1)
+                for key, slot in self.cache.snapshot().items():
+                    self._expert_map_cpu[key.expert_id] = slot
+                self.expert_map.copy_(self._expert_map_cpu, non_blocking=True)
 
             self._maybe_log_stats()
             return ExpertWeightResult(
