@@ -7,14 +7,17 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.expert_disk_store import DiskExpertStore
 from vllm.model_executor.layers.fused_moe.expert_pager import (
+    ExpertLoad,
     ExpertPageKey,
+    ExpertSlotPlan,
     LRUExpertSlotCache,
 )
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
@@ -22,6 +25,21 @@ from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
 )
 
 logger = init_logger(__name__)
+
+_NVME_IO_WORKERS = max(
+    1, int(os.environ.get("VLLM_DSV41_NVME_IO_WORKERS", "32"))
+)
+_NVME_IO_POOL = ThreadPoolExecutor(
+    max_workers=_NVME_IO_WORKERS,
+    thread_name_prefix="vllm-dsv41-nvme",
+)
+
+
+@dataclass
+class _PrefetchedExpertGroup:
+    required: tuple[ExpertPageKey, ...]
+    plan: ExpertSlotPlan
+    futures: list[tuple[ExpertLoad, Future[tuple[bytearray, float]]]]
 
 
 class FlashInferMxfp4DiskExpertProvider:
@@ -125,10 +143,7 @@ class FlashInferMxfp4DiskExpertProvider:
                 self._staging.append(view)
         self._copy_done: torch.cuda.Event | None = None
         self._compute_done: torch.cuda.Event | None = None
-        self._pool = ThreadPoolExecutor(
-            max_workers=self.read_batch,
-            thread_name_prefix="vllm-expert-nvme",
-        )
+        self._pool = _NVME_IO_POOL
         self._lock = threading.RLock()
         self.disk_reads = 0
         self.cache_hits = 0
@@ -334,6 +349,111 @@ class FlashInferMxfp4DiskExpertProvider:
             self._copy_done.record(torch.cuda.current_stream())
             self.disk_reads += len(batch)
 
+    def _read_record_buffer_timed(
+        self, expert_id: int
+    ) -> tuple[bytearray, float]:
+        started = time.perf_counter()
+        buffer = self.store.read_record_buffer(expert_id)
+        return buffer, time.perf_counter() - started
+
+    def _copy_buffer_to_slot(
+        self, buffer: bytearray, slot: int
+    ) -> None:
+        record = torch.frombuffer(buffer, dtype=torch.uint8)
+        if self.uses_uva:
+            assert self.cpu_backing is not None
+            for name, backing in self.cpu_backing.items():
+                backing[slot].reshape(-1).view(torch.uint8).copy_(
+                    self.store.field_view(record, name).reshape(-1).view(torch.uint8)
+                )
+            return
+        self._copy_record_to_slot(record, slot)
+
+    def _publish_expert_map(self) -> None:
+        self._expert_map_cpu.fill_(-1)
+        for key, slot in self.cache.snapshot().items():
+            self._expert_map_cpu[key.expert_id] = slot
+        self.expert_map.copy_(self._expert_map_cpu, non_blocking=True)
+
+    def prefetch_keys(
+        self, required: tuple[ExpertPageKey, ...]
+    ) -> _PrefetchedExpertGroup:
+        """Start buffered NVMe reads without touching resident slots.
+
+        The caller launches this before computing the current expert group and
+        activates it only after that compute has been submitted. This preserves
+        slot correctness while overlapping the next group's disk latency.
+        """
+        if len(required) > self.capacity:
+            raise RuntimeError(
+                f"expert group has {len(required)} experts but cache capacity "
+                f"is {self.capacity}"
+            )
+        with self._lock:
+            before = self.cache.snapshot()
+            plan = self.cache.plan(required)
+            self.cache_hits += sum(1 for key in required if key in before)
+            self.cache_misses += len(plan.loads)
+            loads = sorted(plan.loads, key=lambda load: load.key.expert_id)
+            futures = [
+                (
+                    load,
+                    self._pool.submit(
+                        self._read_record_buffer_timed, load.key.expert_id
+                    ),
+                )
+                for load in loads
+            ]
+            return _PrefetchedExpertGroup(required, plan, futures)
+
+    def activate_prefetch(
+        self, prefetched: _PrefetchedExpertGroup
+    ) -> ExpertWeightResult:
+        """Publish a prefetched group after the previous MoE launch."""
+        with self._lock:
+            if prefetched.plan.epoch != self.cache.epoch:
+                raise RuntimeError(
+                    "stale NVMe expert prefetch; cache mapping changed before "
+                    "the prefetched group was activated"
+                )
+
+            completed = [
+                (load, *future.result())
+                for load, future in prefetched.futures
+            ]
+            # Reads in one prefetched group overlap in the shared executor.
+            # The slowest individual read is a closer approximation of the
+            # group's storage-service time than either the sum or host wait.
+            if completed:
+                self.read_seconds += max(seconds for _, _, seconds in completed)
+            records = [(load, buffer) for load, buffer, _ in completed]
+
+            try:
+                if self.uses_uva and records:
+                    self._wait_compute_before_uva_write()
+                for load, buffer in records:
+                    self._copy_buffer_to_slot(buffer, load.slot)
+                if records and not self.uses_uva:
+                    self._copy_done = torch.cuda.Event()
+                    self._copy_done.record(torch.cuda.current_stream())
+                self.disk_reads += len(records)
+                self.cache.commit(prefetched.plan)
+            except Exception:
+                self.cache.reset()
+                self._expert_map_cpu.fill_(-1)
+                self.expert_map.fill_(-1)
+                raise
+
+            if prefetched.plan.loads or prefetched.plan.evictions:
+                self._publish_expert_map()
+
+            self._maybe_log_stats()
+            return ExpertWeightResult(
+                w1=self.w13,
+                w2=self.w2,
+                expert_map=self.expert_map,
+            )
+
     def _maybe_log_stats(self) -> None:
         self.prepare_calls += 1
         if self.stats_every <= 0 or self.prepare_calls % self.stats_every:
@@ -388,12 +508,7 @@ class FlashInferMxfp4DiskExpertProvider:
                 raise
 
             if plan.loads or plan.evictions:
-                # Rebuild a tiny host shadow and publish it with one async copy
-                # instead of launching one CUDA assignment per expert.
-                self._expert_map_cpu.fill_(-1)
-                for key, slot in self.cache.snapshot().items():
-                    self._expert_map_cpu[key.expert_id] = slot
-                self.expert_map.copy_(self._expert_map_cpu, non_blocking=True)
+                self._publish_expert_map()
 
             self._maybe_log_stats()
             return ExpertWeightResult(
@@ -414,7 +529,7 @@ class FlashInferMxfp4DiskExpertProvider:
     def close(self) -> None:
         self._wait_staging_reuse()
         self._wait_compute_before_uva_write()
-        self._pool.shutdown(wait=True)
+        # Shared process-wide I/O pool remains alive for other MoE layers.
 
     def __del__(self) -> None:
         try:

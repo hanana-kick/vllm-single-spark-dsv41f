@@ -1257,8 +1257,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             dtype=torch.bool,
             device=topk_ids.device,
         )
+        prefetched = None
         for group_index, group in enumerate(groups):
-            prepared = provider.prepare_keys(group)
+            prepared = (
+                provider.prepare_keys(group)
+                if prefetched is None
+                else provider.activate_prefetch(prefetched)
+            )
+            next_prefetch = (
+                provider.prefetch_keys(groups[group_index + 1])
+                if group_index + 1 < len(groups)
+                else None
+            )
             group_membership.zero_()
             group_ids = torch.tensor(
                 [key.expert_id for key in group],
@@ -1313,6 +1323,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 shared_experts_input=run_shared_input,
             )
             provider.mark_compute_submitted()
+            prefetched = next_prefetch
             if isinstance(partial, UnfinalizedMoEOutput):
                 raise RuntimeError(
                     "partitioned NVMe prefill does not support deferred MoE finalize"

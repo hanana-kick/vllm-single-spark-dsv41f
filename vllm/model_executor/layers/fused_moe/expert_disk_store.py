@@ -391,6 +391,31 @@ class DiskExpertStore:
             )
         return read_total
 
+    def read_record_buffer(self, expert_id: int) -> bytearray:
+        """Read one complete record into an owned buffered-I/O bytearray.
+
+        Used by the look-ahead prefetch path: disk I/O may run while the GPU is
+        still consuming the current resident slots, so the next expert cannot
+        be written into its destination slot yet.
+        """
+        self._check_expert_id(expert_id)
+        if not self.is_complete:
+            raise RuntimeError("cannot read an incomplete expert store")
+        fd = self._open_buffered_reader()
+        buffer = bytearray(self.record_stride)
+        view = memoryview(buffer)
+        offset = expert_id * self.record_stride
+        got = 0
+        while got < self.record_stride:
+            nbytes = os.preadv(fd, [view[got:]], offset + got)
+            if nbytes <= 0:
+                raise OSError(
+                    f"short prefetched expert read: expert={expert_id} "
+                    f"{got}/{self.record_stride}"
+                )
+            got += nbytes
+        return buffer
+
     def _open_buffered_reader(self) -> int:
         with self._open_lock:
             if self._buffered_fd is None:
