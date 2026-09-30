@@ -74,6 +74,9 @@ class DiskExpertStore:
         raw = max(field.offset + field.nbytes for field in fields)
         self.record_stride = _align_up(raw, ALIGN)
         self.direct_io = direct_io
+        self.drop_page_cache = (
+            os.environ.get("VLLM_DSV41_NVME_DROP_PAGE_CACHE", "1") != "0"
+        )
         self.is_complete = False
         self._fd: int | None = None
         self._buffered_fd: int | None = None
@@ -389,6 +392,7 @@ class DiskExpertStore:
             raise OSError(
                 f"expert field read size mismatch: {read_total}/{total}"
             )
+        self._drop_buffered_pages(file_offset, self.record_stride)
         return read_total
 
     def read_record_buffer(self, expert_id: int) -> bytearray:
@@ -414,13 +418,38 @@ class DiskExpertStore:
                     f"{got}/{self.record_stride}"
                 )
             got += nbytes
+        self._drop_buffered_pages(offset, self.record_stride)
         return buffer
 
     def _open_buffered_reader(self) -> int:
         with self._open_lock:
             if self._buffered_fd is None:
                 self._buffered_fd = os.open(self.path, os.O_RDONLY)
+                if hasattr(os, "posix_fadvise") and hasattr(
+                    os, "POSIX_FADV_RANDOM"
+                ):
+                    os.posix_fadvise(
+                        self._buffered_fd, 0, 0, os.POSIX_FADV_RANDOM
+                    )
             return self._buffered_fd
+
+    def _drop_buffered_pages(self, offset: int, length: int) -> None:
+        if (
+            self.drop_page_cache
+            and self._buffered_fd is not None
+            and hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            try:
+                os.posix_fadvise(
+                    self._buffered_fd,
+                    offset,
+                    length,
+                    os.POSIX_FADV_DONTNEED,
+                )
+            except OSError:
+                # Advisory only; inference correctness must not depend on it.
+                pass
 
     def read_record(self, expert_id: int, dst: torch.Tensor) -> int:
         """Read one complete record, preferring O_DIRECT when requested."""

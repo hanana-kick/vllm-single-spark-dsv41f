@@ -13,6 +13,9 @@ from pathlib import Path
 import torch
 
 _HEADER_LEN = struct.Struct("<Q")
+_DROP_ENGRAM_PAGE_CACHE = (
+    os.environ.get("VLLM_DSV41_ENGRAM_DROP_PAGE_CACHE", "1") != "0"
+)
 _ENGRAM_STAGE_POOL = ThreadPoolExecutor(
     max_workers=max(
         1, int(os.environ.get("VLLM_DSV41_ENGRAM_STAGE_WORKERS", "4"))
@@ -152,6 +155,17 @@ class DiskEngramTable:
         data = os.pread(fd, size, offset)
         if len(data) != size:
             raise OSError(f"short Engram read at {offset}: {len(data)}/{size}")
+        if (
+            _DROP_ENGRAM_PAGE_CACHE
+            and hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            try:
+                os.posix_fadvise(
+                    fd, offset, size, os.POSIX_FADV_DONTNEED
+                )
+            except OSError:
+                pass
         return data
 
     @staticmethod
