@@ -150,6 +150,15 @@ class FlashInferMxfp4DiskExpertProvider:
                 self._staging.append(view)
         self._copy_done: torch.cuda.Event | None = None
         self._inflight_slot_uses: list[_InFlightSlotUse] = []
+        event_pool_size = max(
+            2, int(os.environ.get("VLLM_DSV41_NVME_EVENT_POOL_SIZE", "4"))
+        )
+        self._compute_event_pool = (
+            [torch.cuda.Event() for _ in range(event_pool_size)]
+            if self.uses_uva
+            else []
+        )
+        self._compute_event_cursor = 0
         self._pool = _NVME_IO_POOL
         self._lock = threading.RLock()
         self.disk_reads = 0
@@ -323,7 +332,25 @@ class FlashInferMxfp4DiskExpertProvider:
         self._inflight_slot_uses = [
             use for use in self._inflight_slot_uses if not use.event.query()
         ]
-        event = torch.cuda.Event()
+
+        in_use = {id(use.event) for use in self._inflight_slot_uses}
+        event = None
+        pool_size = len(self._compute_event_pool)
+        for _ in range(pool_size):
+            candidate = self._compute_event_pool[self._compute_event_cursor]
+            self._compute_event_cursor = (
+                self._compute_event_cursor + 1
+            ) % pool_size
+            if id(candidate) not in in_use:
+                event = candidate
+                break
+        if event is None:
+            # The tiny ring is saturated only if several launches from the
+            # same layer are still in flight. Reuse the oldest event safely.
+            oldest = self._inflight_slot_uses.pop(0)
+            oldest.event.synchronize()
+            event = oldest.event
+
         event.record(torch.cuda.current_stream())
         self._inflight_slot_uses.append(_InFlightSlotUse(event, slots))
 
