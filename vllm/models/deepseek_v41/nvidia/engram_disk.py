@@ -183,27 +183,42 @@ class DiskEngramTable:
         runs.append((start, prev + 1))
         return runs
 
-    def _read_runs(
+    def _submit_runs(
         self,
         fd: int,
         base: int,
         runs: list[tuple[int, int]],
         row_bytes: int,
-    ) -> dict[int, bytes]:
-        """Read contiguous row runs in the caller's worker.
+    ) -> list[tuple[int, int, Future[bytes]]]:
+        """Submit one positional read per contiguous run.
 
-        read_rows already submits the weight and scale sides to this pool.
-        Submitting another generation of work from inside those workers can
-        deadlock when the configured pool is small and adds scheduler overhead
-        even with the default pool size.
+        read_rows itself runs on the separate Engram staging executor, so these
+        tasks can safely occupy the row-I/O pool without recursive pool waits.
+        Random hash rows keep high NVMe queue depth, while adjacent rows still
+        collapse into one syscall.
         """
-        result: dict[int, bytes] = {}
-        for start, end in runs:
-            block = self._pread_exact(
-                fd,
-                base + start * row_bytes,
-                (end - start) * row_bytes,
+        return [
+            (
+                start,
+                end,
+                self._pool.submit(
+                    self._pread_exact,
+                    fd,
+                    base + start * row_bytes,
+                    (end - start) * row_bytes,
+                ),
             )
+            for start, end in runs
+        ]
+
+    @staticmethod
+    def _collect_runs(
+        futures: list[tuple[int, int, Future[bytes]]],
+        row_bytes: int,
+    ) -> dict[int, bytes]:
+        result: dict[int, bytes] = {}
+        for start, end, future in futures:
+            block = future.result()
             for i, row in enumerate(range(start, end)):
                 lo = i * row_bytes
                 result[row] = block[lo : lo + row_bytes]
@@ -247,18 +262,14 @@ class DiskEngramTable:
             unique_list = [int(v) for v in unique.tolist()]
             runs = self._contiguous_runs(unique_list)
 
-            w_future = self._pool.submit(
-                self._read_runs, self.w_fd, self.w_base, runs, self.dim
+            w_futures = self._submit_runs(
+                self.w_fd, self.w_base, runs, self.dim
             )
-            s_future = self._pool.submit(
-                self._read_runs,
-                self.s_fd,
-                self.s_base,
-                runs,
-                self.scale_cols,
+            s_futures = self._submit_runs(
+                self.s_fd, self.s_base, runs, self.scale_cols
             )
-            w_rows = w_future.result()
-            s_rows = s_future.result()
+            w_rows = self._collect_runs(w_futures, self.dim)
+            s_rows = self._collect_runs(s_futures, self.scale_cols)
 
             w_bytes = b"".join(w_rows[row] for row in unique_list)
             s_bytes = b"".join(s_rows[row] for row in unique_list)
