@@ -178,3 +178,34 @@ continues with buffered `preadv`.
 
 Pager stats report cumulative `direct=` and `buffered=` expert field reads,
 so the active path is visible without a profiler.
+
+
+## Current performance overlap knobs
+
+The pager now pipelines wide-prefill expert groups. While group N executes on
+FlashInfer CUTLASS, the first miss batch for group N+1 is read on the shared
+process-wide NVMe executor. Remaining misses receive buffered
+`POSIX_FADV_WILLNEED` hints so Linux can start readahead without allocating a
+full second expert group in userspace.
+
+Useful tuning variables:
+
+```bash
+# Expert record reads issued concurrently across all MoE layers.
+VLLM_DSV41_NVME_IO_WORKERS=32
+
+# Actual prefetched records retained in userspace per next group.
+VLLM_DSV41_NVME_EXPERT_READ_BATCH=8
+
+# Do not split tiny decode batches into hit/miss MoE kernels. The split path is
+# intended to hide I/O behind enough resident compute.
+VLLM_DSV41_NVME_SPLIT_MISS_MIN_TOKENS=64
+
+# Shared Engram I/O queue across every Engram table.
+VLLM_DSV41_ENGRAM_IO_WORKERS=32
+VLLM_DSV41_ENGRAM_STAGE_WORKERS=4
+```
+
+For small C1 decode, the default keeps one MoE kernel per layer. For larger
+prefill/multi-request batches, mixed-residency work may split so resident
+compute overlaps the next NVMe misses.
