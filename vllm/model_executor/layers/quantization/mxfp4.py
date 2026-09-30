@@ -1416,11 +1416,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         topk_ids_long = topk_ids.to(dtype=torch.long)
         valid_route = topk_ids_long >= 0
         safe_topk_ids = topk_ids_long.clamp_min(0)
-        group_membership = torch.zeros(
-            layer.global_num_experts,
-            dtype=torch.bool,
+
+        # Build the 384-entry expert->partition map once. Each route then needs
+        # one indexed lookup instead of reconstructing a boolean membership
+        # tensor for every cache-sized partition.
+        group_of_expert_cpu = [-1] * layer.global_num_experts
+        for group_index, group in enumerate(groups):
+            for key in group:
+                group_of_expert_cpu[key.expert_id] = group_index
+        group_of_expert = torch.tensor(
+            group_of_expert_cpu,
+            dtype=torch.int16,
             device=topk_ids.device,
         )
+        route_group = group_of_expert[safe_topk_ids]
         prefetched = None
         for group_index, group in enumerate(groups):
             prepared = (
@@ -1434,14 +1443,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 else None
             )
 
-            group_membership.zero_()
-            group_ids = torch.tensor(
-                [key.expert_id for key in group],
-                dtype=torch.long,
-                device=topk_ids.device,
-            )
-            group_membership[group_ids] = True
-            active = valid_route & group_membership[safe_topk_ids]
+            active = valid_route & (route_group == group_index)
             token_rows = torch.nonzero(
                 active.any(dim=-1), as_tuple=False
             ).squeeze(-1)
