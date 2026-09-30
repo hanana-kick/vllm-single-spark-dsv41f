@@ -1,0 +1,105 @@
+name: DSV41 NVMe smoke
+
+on:
+  push:
+    branches:
+      - feature/dsv41-nvme-expert-pager
+    paths:
+      - "vllm/model_executor/layers/fused_moe/**"
+      - "vllm/model_executor/layers/quantization/mxfp4.py"
+      - "vllm/models/deepseek_v41/**"
+      - "scripts/dsv41_single_spark_nvme.sh"
+      - ".github/workflows/dsv41-nvme-smoke.yml"
+  pull_request:
+    paths:
+      - "vllm/model_executor/layers/fused_moe/**"
+      - "vllm/model_executor/layers/quantization/mxfp4.py"
+      - "vllm/models/deepseek_v41/**"
+      - "scripts/dsv41_single_spark_nvme.sh"
+      - ".github/workflows/dsv41-nvme-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  syntax-and-pager:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile modified Python paths
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          roots = [
+              Path("vllm/model_executor/layers/fused_moe"),
+              Path("vllm/model_executor/layers/quantization/mxfp4.py"),
+              Path("vllm/models/deepseek_v41/nvidia"),
+          ]
+          files = []
+          for root in roots:
+              if root.is_file():
+                  files.append(root)
+              else:
+                  files.extend(root.rglob("*.py"))
+          for path in sorted(set(files)):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          print(f"AST parsed {len(set(files))} Python files")
+          PY
+
+      - name: Exercise pure expert pager
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import json
+          import struct
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          path = Path("vllm/model_executor/layers/fused_moe/expert_pager.py")
+          spec = importlib.util.spec_from_file_location("dsv41_expert_pager_smoke", path)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          Key = module.ExpertPageKey
+          cache = module.LRUExpertSlotCache(2)
+          a, b, c = Key(0, 1), Key(0, 2), Key(0, 3)
+          p = cache.plan([a, b])
+          cache.commit(p)
+          p = cache.plan([a])
+          cache.commit(p)
+          p = cache.plan([c])
+          assert [(e.key, e.slot) for e in p.evictions] == [(b, 1)]
+          cache.commit(p)
+          assert cache.snapshot() == {a: 0, c: 1}
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp)
+              payload = b"abcd"
+              header = {
+                  "model.layers.3.mlp.experts.7.w1.weight": {
+                      "dtype": "U8",
+                      "shape": [4],
+                      "data_offsets": [0, 4],
+                  }
+              }
+              raw = json.dumps(header, separators=(",", ":")).encode()
+              shard = root / "model.safetensors"
+              shard.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
+              index = module.SafetensorExpertIndex.from_model_dir(root)
+              page = index[Key(3, 7)]
+              tensor = page.tensors["w1.weight"]
+              with tensor.path.open("rb") as f:
+                  f.seek(tensor.offset)
+                  assert f.read(tensor.nbytes) == payload
+          print("expert pager smoke passed")
+          PY
+
+      - name: Check launcher shell syntax
+        run: bash -n scripts/dsv41_single_spark_nvme.sh
