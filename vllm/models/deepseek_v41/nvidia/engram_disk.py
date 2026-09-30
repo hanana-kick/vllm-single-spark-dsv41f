@@ -190,23 +190,20 @@ class DiskEngramTable:
         runs: list[tuple[int, int]],
         row_bytes: int,
     ) -> dict[int, bytes]:
-        """Read contiguous row runs with one pread per run."""
-        futures = [
-            (
-                start,
-                end,
-                self._pool.submit(
-                    self._pread_exact,
-                    fd,
-                    base + start * row_bytes,
-                    (end - start) * row_bytes,
-                ),
-            )
-            for start, end in runs
-        ]
+        """Read contiguous row runs in the caller's worker.
+
+        read_rows already submits the weight and scale sides to this pool.
+        Submitting another generation of work from inside those workers can
+        deadlock when the configured pool is small and adds scheduler overhead
+        even with the default pool size.
+        """
         result: dict[int, bytes] = {}
-        for start, end, future in futures:
-            block = future.result()
+        for start, end in runs:
+            block = self._pread_exact(
+                fd,
+                base + start * row_bytes,
+                (end - start) * row_bytes,
+            )
             for i, row in enumerate(range(start, end)):
                 lo = i * row_bytes
                 result[row] = block[lo : lo + row_bytes]
