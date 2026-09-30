@@ -7,7 +7,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -138,19 +137,37 @@ class FlashInferMxfp4DiskExpertProvider:
         return self.cache.capacity
 
     def _required(self, topk_ids: torch.Tensor) -> tuple[ExpertPageKey, ...]:
-        ids = topk_ids.detach().reshape(-1).to("cpu").tolist()
-        result: list[ExpertPageKey] = []
-        seen: set[int] = set()
-        for raw in ids:
-            expert_id = int(raw)
-            if expert_id < 0:
-                continue
-            if expert_id >= self.global_num_experts:
-                raise ValueError(f"routed expert id {expert_id} is out of range")
-            if expert_id not in seen:
-                seen.add(expert_id)
-                result.append(ExpertPageKey(self.layer_id, expert_id))
-        return tuple(result)
+        flat = topk_ids.detach().reshape(-1)
+        # Decode-sized routing matrices are cheaper to copy directly. Wide
+        # prefills must not synchronize tens of thousands of route ids to the
+        # CPU just to discover at most global_num_experts unique values.
+        if flat.numel() <= 256:
+            ids = flat.to("cpu").tolist()
+            seen: set[int] = set()
+            unique_ids: list[int] = []
+            for raw in ids:
+                expert_id = int(raw)
+                if expert_id < 0:
+                    continue
+                if expert_id >= self.global_num_experts:
+                    raise ValueError(
+                        f"routed expert id {expert_id} is out of range"
+                    )
+                if expert_id not in seen:
+                    seen.add(expert_id)
+                    unique_ids.append(expert_id)
+        else:
+            valid = flat[flat >= 0]
+            if valid.numel() == 0:
+                return ()
+            unique = torch.unique(valid, sorted=False)
+            if int(unique.max()) >= self.global_num_experts:
+                raise ValueError("routed expert id is out of range")
+            unique_ids = [int(value) for value in unique.to("cpu").tolist()]
+
+        return tuple(
+            ExpertPageKey(self.layer_id, expert_id) for expert_id in unique_ids
+        )
 
     def partition(
         self, topk_ids: torch.Tensor
@@ -168,15 +185,22 @@ class FlashInferMxfp4DiskExpertProvider:
         if topk_ids.numel() <= self.capacity:
             return (self._required(topk_ids),)
 
-        flat = [
-            int(value)
-            for value in topk_ids.detach().reshape(-1).to("cpu").tolist()
-            if int(value) >= 0
-        ]
-        if not flat:
+        flat = topk_ids.detach().reshape(-1)
+        valid = flat[flat >= 0]
+        if valid.numel() == 0:
             return ((),)
 
-        counts = Counter(flat)
+        # Count on the accelerator, then transfer only <=384 expert IDs and
+        # counts to the host. This avoids a large GPU->CPU synchronization on
+        # every prefill layer.
+        unique, counts_tensor = torch.unique(
+            valid, sorted=False, return_counts=True
+        )
+        if int(unique.max()) >= self.global_num_experts:
+            raise ValueError("routed expert id is out of range")
+        ids_cpu = [int(value) for value in unique.to("cpu").tolist()]
+        counts_cpu = [int(value) for value in counts_tensor.to("cpu").tolist()]
+        counts = dict(zip(ids_cpu, counts_cpu, strict=True))
         ordered_ids = sorted(counts, key=lambda expert: (counts[expert], expert))
         required = tuple(
             ExpertPageKey(self.layer_id, expert_id) for expert_id in ordered_ids
