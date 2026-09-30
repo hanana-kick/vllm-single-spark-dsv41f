@@ -1228,22 +1228,150 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         groups = provider.partition(topk_ids)
         if len(groups) == 1:
-            prepared = provider.prepare_keys(groups[0])
-            output = self.moe_kernel.apply(
-                hidden_states=x,
-                w1=prepared.w1,
-                w2=prepared.w2,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                expert_map=prepared.expert_map,
-                shared_experts=shared_experts,
-                shared_experts_input=shared_experts_input,
+            required = groups[0]
+            resident, missing = provider.split_resident(required)
+
+            # Normal all-hit/all-miss cases stay on the single-kernel path.
+            # Mixed residency can overlap missing NVMe reads with useful routed
+            # compute, but only when shared experts are externally scheduled.
+            split_miss = (
+                bool(resident)
+                and bool(missing)
+                and not (
+                    shared_experts is not None
+                    and self.moe_kernel.can_overlap_shared_experts
+                )
             )
-            provider.mark_compute_submitted()
-            return output
+            if not split_miss:
+                prepared = provider.prepare_keys(required)
+                output = self.moe_kernel.apply(
+                    hidden_states=x,
+                    w1=prepared.w1,
+                    w2=prepared.w2,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    expert_map=prepared.expert_map,
+                    shared_experts=shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+                provider.mark_compute_submitted()
+                return output
+
+            # Start all missing reads before computing the already-resident
+            # routed contribution.
+            prefetched = provider.prefetch_keys(required)
+            current = provider.current_weights()
+            result = torch.zeros_like(x)
+
+            resident_membership = torch.zeros(
+                layer.global_num_experts,
+                dtype=torch.bool,
+                device=topk_ids.device,
+            )
+            resident_ids = torch.tensor(
+                [key.expert_id for key in resident],
+                dtype=torch.long,
+                device=topk_ids.device,
+            )
+            resident_membership[resident_ids] = True
+            topk_long = topk_ids.to(dtype=torch.long)
+            valid = topk_long >= 0
+            safe_ids = topk_long.clamp_min(0)
+            resident_active = valid & resident_membership[safe_ids]
+            resident_rows = torch.nonzero(
+                resident_active.any(dim=-1), as_tuple=False
+            ).squeeze(-1)
+
+            if resident_rows.numel():
+                selected_active = resident_active.index_select(0, resident_rows)
+                selected_ids = topk_ids.index_select(0, resident_rows)
+                selected_weights = topk_weights.index_select(0, resident_rows)
+                fallback = resident[0].expert_id
+                hit_ids = torch.where(
+                    selected_active,
+                    selected_ids,
+                    torch.full_like(selected_ids, fallback),
+                )
+                hit_weights = torch.where(
+                    selected_active,
+                    selected_weights,
+                    torch.zeros_like(selected_weights),
+                )
+                hit_partial = self.moe_kernel.apply(
+                    hidden_states=x.index_select(0, resident_rows),
+                    w1=current.w1,
+                    w2=current.w2,
+                    topk_weights=hit_weights,
+                    topk_ids=hit_ids,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    expert_map=current.expert_map,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
+                if isinstance(hit_partial, UnfinalizedMoEOutput):
+                    raise RuntimeError(
+                        "NVMe split-miss path does not support deferred MoE finalize"
+                    )
+                result.index_add_(0, resident_rows, hit_partial)
+                provider.mark_compute_submitted()
+
+            # At this point NVMe reads have run in parallel with the hit-side
+            # kernel. Publishing waits only if the GPU is still consuming an
+            # overwritten UVA slot.
+            prepared = provider.activate_prefetch(prefetched)
+
+            missing_membership = torch.zeros_like(resident_membership)
+            missing_ids = torch.tensor(
+                [key.expert_id for key in missing],
+                dtype=torch.long,
+                device=topk_ids.device,
+            )
+            missing_membership[missing_ids] = True
+            missing_active = valid & missing_membership[safe_ids]
+            missing_rows = torch.nonzero(
+                missing_active.any(dim=-1), as_tuple=False
+            ).squeeze(-1)
+            if missing_rows.numel():
+                selected_active = missing_active.index_select(0, missing_rows)
+                selected_ids = topk_ids.index_select(0, missing_rows)
+                selected_weights = topk_weights.index_select(0, missing_rows)
+                fallback = missing[0].expert_id
+                miss_ids = torch.where(
+                    selected_active,
+                    selected_ids,
+                    torch.full_like(selected_ids, fallback),
+                )
+                miss_weights = torch.where(
+                    selected_active,
+                    selected_weights,
+                    torch.zeros_like(selected_weights),
+                )
+                miss_partial = self.moe_kernel.apply(
+                    hidden_states=x.index_select(0, missing_rows),
+                    w1=prepared.w1,
+                    w2=prepared.w2,
+                    topk_weights=miss_weights,
+                    topk_ids=miss_ids,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    expert_map=prepared.expert_map,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
+                if isinstance(miss_partial, UnfinalizedMoEOutput):
+                    raise RuntimeError(
+                        "NVMe split-miss path does not support deferred MoE finalize"
+                    )
+                result.index_add_(0, missing_rows, miss_partial)
+                provider.mark_compute_submitted()
+
+            return result
 
         # Wide prefill can touch more unique experts than the resident cache.
         # On the TP1 paging path shared experts are orchestrated by MoERunner

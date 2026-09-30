@@ -483,6 +483,23 @@ class FlashInferMxfp4DiskExpertProvider:
             self.uses_uva,
         )
 
+    def split_resident(
+        self, required: tuple[ExpertPageKey, ...]
+    ) -> tuple[tuple[ExpertPageKey, ...], tuple[ExpertPageKey, ...]]:
+        """Split required experts without changing LRU state."""
+        resident_map = self.cache.snapshot()
+        resident = tuple(key for key in required if key in resident_map)
+        missing = tuple(key for key in required if key not in resident_map)
+        return resident, missing
+
+    def current_weights(self) -> ExpertWeightResult:
+        """Return the currently published slots without changing residency."""
+        return ExpertWeightResult(
+            w1=self.w13,
+            w2=self.w2,
+            expert_map=self.expert_map,
+        )
+
     def prepare_keys(
         self, required: tuple[ExpertPageKey, ...]
     ) -> ExpertWeightResult:
