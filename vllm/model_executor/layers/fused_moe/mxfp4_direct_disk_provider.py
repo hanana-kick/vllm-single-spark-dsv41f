@@ -205,15 +205,18 @@ class FlashInferMxfp4DiskExpertProvider:
             valid = flat[flat >= 0].to(dtype=torch.long)
             if valid.numel() == 0:
                 return ()
-            if int(valid.max()) >= self.global_num_experts:
-                raise ValueError("routed expert id is out of range")
-            counts = torch.bincount(
+            counts_cpu = torch.bincount(
                 valid, minlength=self.global_num_experts
-            )
-            counts_cpu = counts.to("cpu").tolist()
+            ).to("cpu").tolist()
+            if len(counts_cpu) > self.global_num_experts and any(
+                counts_cpu[self.global_num_experts :]
+            ):
+                raise ValueError("routed expert id is out of range")
             unique_ids = [
                 expert_id
-                for expert_id, count in enumerate(counts_cpu)
+                for expert_id, count in enumerate(
+                    counts_cpu[: self.global_num_experts]
+                )
                 if count
             ]
 
@@ -246,15 +249,18 @@ class FlashInferMxfp4DiskExpertProvider:
         # cheaper and more predictable than sorting/uniquing a large route
         # matrix. Only 384 counts cross to the host.
         valid = valid.to(dtype=torch.long)
-        if int(valid.max()) >= self.global_num_experts:
-            raise ValueError("routed expert id is out of range")
-        counts_tensor = torch.bincount(
+        counts_cpu = torch.bincount(
             valid, minlength=self.global_num_experts
-        )
-        counts_cpu = counts_tensor.to("cpu").tolist()
+        ).to("cpu").tolist()
+        if len(counts_cpu) > self.global_num_experts and any(
+            counts_cpu[self.global_num_experts :]
+        ):
+            raise ValueError("routed expert id is out of range")
         counts = {
             expert_id: int(count)
-            for expert_id, count in enumerate(counts_cpu)
+            for expert_id, count in enumerate(
+                counts_cpu[: self.global_num_experts]
+            )
             if count
         }
         ordered_ids = sorted(
