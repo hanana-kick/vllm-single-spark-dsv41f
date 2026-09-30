@@ -1298,15 +1298,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 continue
 
             fallback = group[0].expert_id
-            group_topk_ids = torch.where(
-                active, topk_ids, torch.full_like(topk_ids, fallback)
-            )
-            group_topk_weights = torch.where(
-                active, topk_weights, torch.zeros_like(topk_weights)
-            )
             run_x = x.index_select(0, token_rows)
-            run_ids = group_topk_ids.index_select(0, token_rows)
-            run_weights = group_topk_weights.index_select(0, token_rows)
+            selected_active = active.index_select(0, token_rows)
+            selected_ids = topk_ids.index_select(0, token_rows)
+            selected_weights = topk_weights.index_select(0, token_rows)
+            run_ids = torch.where(
+                selected_active,
+                selected_ids,
+                torch.full_like(selected_ids, fallback),
+            )
+            run_weights = torch.where(
+                selected_active,
+                selected_weights,
+                torch.zeros_like(selected_weights),
+            )
 
             partial = self.moe_kernel.apply(
                 hidden_states=run_x,
