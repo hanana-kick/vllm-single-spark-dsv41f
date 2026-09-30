@@ -1249,14 +1249,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Execute exact partial sums in cache-sized expert groups instead of
         # thrashing the LRU one token at a time.
         result = None
+        topk_ids_long = topk_ids.to(dtype=torch.long)
+        valid_route = topk_ids_long >= 0
+        safe_topk_ids = topk_ids_long.clamp_min(0)
+        group_membership = torch.zeros(
+            layer.global_num_experts,
+            dtype=torch.bool,
+            device=topk_ids.device,
+        )
         for group_index, group in enumerate(groups):
             prepared = provider.prepare_keys(group)
+            group_membership.zero_()
             group_ids = torch.tensor(
                 [key.expert_id for key in group],
-                dtype=topk_ids.dtype,
+                dtype=torch.long,
                 device=topk_ids.device,
             )
-            active = torch.isin(topk_ids, group_ids)
+            group_membership[group_ids] = True
+            active = valid_route & group_membership[safe_topk_ids]
             fallback = group[0].expert_id
             group_topk_ids = torch.where(
                 active, topk_ids, torch.full_like(topk_ids, fallback)
